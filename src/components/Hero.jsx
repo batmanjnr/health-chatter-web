@@ -100,8 +100,8 @@ export default function Hero() {
             seamless patient care experiences.
           </p>
           <div className="hero__ctas">
-            <a href="#features" className="btn btn--yellow">Get Started</a>
-            <a href="#demo" className="btn btn--white">Book Demo</a>
+            <a href="/signup" className="btn btn--yellow">Get Started</a>
+            <a href="/login" className="btn btn--white">Sign In</a>
           </div>
         </div>
       </div>

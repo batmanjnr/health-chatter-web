@@ -36,8 +36,8 @@ export default function Navbar() {
           </li>
         ))}
         <li className="nav__actions">
-          <a href="#signin" className="btn btn--white">Sign In</a>
-          <a href="#demo" className="btn btn--yellow">Book Demo</a>
+          <a href="/login" className="btn btn--white">Sign In</a>
+          <a href="/signup" className="btn btn--yellow">Book Demo</a>
         </li>
       </ul>
     </nav>
