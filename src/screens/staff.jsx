@@ -5,7 +5,7 @@ import { useAuth } from '../auth/AuthContext.jsx'
 import { fmtDate, fmtTime, useCollection } from '../lib/store.js'
 import {
   Alert, Avatar, Badge, Button, Card, Field, Grid, Icon, KeyValue, List, Modal, PageHeader,
-  Progress, SearchInput, StatGrid, Table, Tabs, filterRows, useToast,
+  Progress, SearchInput, StatGrid, Table, Tabs, filterRows, useToast, DeleteButton,
 } from '../components/ui/index.jsx'
 
 const LEVELS = { RED: 'Immediate', ORANGE: 'Very urgent (10 min)', YELLOW: 'Urgent (60 min)', GREEN: 'Standard (2 h)' }
@@ -18,6 +18,7 @@ export function NurseDashboard() {
   const [triage] = useCollection('triageQueue')
   const [tasks] = useCollection('nursingTasks')
   const [wards] = useCollection('wards')
+  const [adt] = useCollection('admissions')
   return (
     <>
       <PageHeader title={`Hello, ${user.name}`} subtitle={`${user.facility} · Day shift 07:00–19:00`} />
@@ -25,7 +26,7 @@ export function NurseDashboard() {
         { label: 'Waiting for triage', value: triage.filter((t) => t.status === 'WAITING').length, hint: `${triage.filter((t) => t.level === 'RED').length} red`, icon: 'Siren', tone: 'pink' },
         { label: 'Tasks due', value: tasks.filter((t) => t.status === 'DUE').length, icon: 'ClipboardCheck', tone: 'yellow' },
         { label: 'Bed occupancy', value: `${Math.round((wards.reduce((s, w) => s + w.occupied, 0) / wards.reduce((s, w) => s + w.beds, 0)) * 100)}%`, icon: 'Bed', tone: 'teal' },
-        { label: 'Discharges today', value: 2, icon: 'LogOut', tone: 'blue' },
+        { label: 'Discharges today', value: adt.filter((a) => a.type === 'DISCHARGE' && new Date(a.at).toDateString() === new Date().toDateString()).length, icon: 'LogOut', tone: 'blue' },
       ]} />
       <Grid>
         <Card title="Triage queue" action={<Link to="/nurse/triage">Open</Link>}>
@@ -203,13 +204,14 @@ export function ChwDashboard() {
   const [visits] = useCollection('homeVisits')
   const [screens] = useCollection('screenings')
   const [sync] = useCollection('syncQueue')
+  const [refs] = useCollection('referrals')
   return (
     <>
-      <PageHeader title={`Hello, ${user.name}`} subtitle={`${user.facility} catchment · Mushin LGA`} />
+      <PageHeader title={`Hello, ${user.name}`} subtitle={`${user.facility} catchment`} />
       <StatGrid items={[
         { label: 'Visits today', value: visits.filter((v) => new Date(v.at).toDateString() === new Date().toDateString()).length, icon: 'Footprints', tone: 'teal' },
         { label: 'High-risk screenings', value: screens.filter((s) => s.flag === 'HIGH').length, icon: 'TriangleAlert', tone: 'pink' },
-        { label: 'Pending referrals', value: 1, icon: 'Send', tone: 'blue' },
+        { label: 'Pending referrals', value: refs.filter((r) => r.status === 'PENDING' && r._owner === user.id).length, icon: 'Send', tone: 'blue' },
         { label: 'Waiting to sync', value: sync.filter((s) => s.status === 'QUEUED').length, icon: 'RefreshCw', tone: 'yellow' },
       ]} />
       <Card title="Today's route">
@@ -231,7 +233,7 @@ export function HomeVisits() {
         <Table rows={rows} columns={[
           { label: 'When', render: (r) => fmtDate(r.at, true) }, { label: 'Household', key: 'household' }, { label: 'Address', key: 'address' }, { label: 'Purpose', key: 'purpose' },
           { label: 'Status', render: (r) => <Badge>{r.status}</Badge> },
-          { label: '', render: (r) => r.status !== 'DONE' && <Button size="sm" onClick={() => setSel(r)}>Record visit</Button> },
+          { label: '', render: (r) => <div className="row-actions">{r.status !== 'DONE' && <Button size="sm" onClick={() => setSel(r)}>Record visit</Button>}<DeleteButton what={`the visit to ${r.household}`} onConfirm={() => api.remove(r.id)} /></div> },
         ]} />
       </Card>
       <Modal open={!!sel} title={`Visit — ${sel?.household}`} onClose={() => setSel(null)} footer={<Button onClick={() => { api.update(sel.id, { status: 'DONE' }); sync.add({ item: `Home visit note — ${sel.household}`, createdAt: new Date().toISOString(), status: 'QUEUED' }); setSel(null); toast('Visit saved offline — will sync') }}>Save visit</Button>}>
@@ -378,8 +380,8 @@ export function CheckIn() {
           { label: 'Status', render: (r) => <Badge>{r.status}</Badge> },
           { label: '', render: (r) => (
             <div className="row-actions">
-              {r.status === 'EXPECTED' && <Button size="sm" onClick={() => { api.update(r.id, { status: 'WAITING' }); toast('Arrived — insurance verified') }}>Arrived</Button>}
-              {r.status === 'WAITING' && <Button size="sm" onClick={() => { api.update(r.id, { status: 'CHECKED_IN' }); toast('Sent to nurse for vitals') }}>Send to nurse</Button>}
+              {r.status === 'EXPECTED' && <Button size="sm" onClick={() => { api.update(r.id, { status: 'WAITING', arrivedAt: new Date().toISOString() }); toast('Arrived — insurance verified') }}>Arrived</Button>}
+              {r.status === 'WAITING' && <Button size="sm" onClick={() => { api.update(r.id, { status: 'CHECKED_IN', calledAt: new Date().toISOString() }); toast('Sent to nurse for vitals') }}>Send to nurse</Button>}
             </div>
           ) },
         ]} />
@@ -389,11 +391,16 @@ export function CheckIn() {
 }
 
 export function ReceptionAppointments() {
+  const { user } = useAuth()
   const toast = useToast()
   const [rows, api] = useCollection('appointments')
   const [patients] = useCollection('patients')
   const [open, setOpen] = useState(false)
-  const [f, setF] = useState({ patient: patients[0]?.name, doctor: 'Dr. Emeka Obi', at: '', type: 'IN_PERSON', reason: '' })
+  const [doctors] = useCollection('doctors')
+  const facilityDoctors = doctors.filter((x) => x.hospital === user.facility)
+  const [f, setF] = useState({ patient: '', doctor: '', at: '', type: 'IN_PERSON', reason: '' })
+  const patientName = f.patient || patients[0]?.name
+  const doctorName = f.doctor || facilityDoctors[0]?.name
   return (
     <>
       <PageHeader title="Appointments" subtitle="Book, reschedule and cancel on behalf of patients. Reminders go by SMS." actions={<Button icon="CalendarPlus" onClick={() => setOpen(true)}>Book appointment</Button>} />
@@ -404,10 +411,10 @@ export function ReceptionAppointments() {
           { label: '', render: (r) => r.status !== 'CANCELLED' && r.status !== 'COMPLETED' && <Button size="sm" variant="ghost" onClick={() => { api.update(r.id, { status: 'CANCELLED' }); toast('Cancelled — patient notified') }}>Cancel</Button> },
         ]} />
       </Card>
-      <Modal open={open} title="Book appointment" onClose={() => setOpen(false)} footer={<Button disabled={!f.at} onClick={() => { const p = patients.find((x) => x.name === f.patient); api.add({ ...f, patientId: p?.id, at: new Date(f.at).toISOString(), status: 'CONFIRMED', specialty: 'Internal Medicine', facility: 'LUTH, Idi-Araba' }); setOpen(false); toast('Booked — SMS reminder scheduled') }}>Book</Button>}>
+      <Modal open={open} title="Book appointment" onClose={() => setOpen(false)} footer={<Button disabled={!f.at} onClick={() => { const p = patients.find((x) => x.name === patientName); const doc = facilityDoctors.find((x) => x.name === doctorName); api.add({ ...f, patient: patientName, doctor: doctorName, patientId: p?.id, at: new Date(f.at).toISOString(), status: 'CONFIRMED', doctorId: doc?.id, specialty: doc?.specialty ?? '—', facility: user.facility }); setOpen(false); toast('Booked') }}>Book</Button>}>
         <div className="form">
-          <Field label="Patient" as="select" options={patients.map((p) => p.name)} value={f.patient} onChange={(e) => setF({ ...f, patient: e.target.value })} />
-          <Field label="Doctor" as="select" options={['Dr. Emeka Obi', 'Dr. Chiamaka Eze', 'Dr. Ngozi Adeyemi']} value={f.doctor} onChange={(e) => setF({ ...f, doctor: e.target.value })} />
+          <Field label="Patient" as="select" options={patients.map((p) => p.name)} value={patientName} onChange={(e) => setF({ ...f, patient: e.target.value })} />
+          <Field label="Doctor" as="select" options={facilityDoctors.map((x) => x.name)} value={doctorName} onChange={(e) => setF({ ...f, doctor: e.target.value })} />
           <Field label="Date & time" type="datetime-local" value={f.at} onChange={(e) => setF({ ...f, at: e.target.value })} />
           <Field label="Type" as="select" options={['IN_PERSON', 'TELEMEDICINE']} value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })} />
           <Field label="Reason" value={f.reason} onChange={(e) => setF({ ...f, reason: e.target.value })} />

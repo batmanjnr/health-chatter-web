@@ -2,7 +2,9 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { AuthProvider, useAuth } from './auth/AuthContext.jsx'
 import RequireRole from './auth/RequireRole.jsx'
 import { ROLES, homeFor } from './config/roles.js'
-import { ToastProvider } from './components/ui/index.jsx'
+import { useEffect } from 'react'
+import { ToastProvider, useToast } from './components/ui/index.jsx'
+import { onStoreError } from './lib/store.js'
 import AppShell from './layouts/AppShell.jsx'
 import Landing from './pages/Landing.jsx'
 import * as Auth from './screens/auth.jsx'
@@ -67,8 +69,8 @@ const SCREENS = {
     ['network', <O.ProviderNetwork />], ['reports', <O.ClaimsReports />],
   ],
   MODERATOR: [
-    ['', <Pl.ModeratorDashboard />], ['verification', <Pl.ProviderVerification />], ['facilities', <Pl.FacilityVerification />],
-    ['complaints', <Pl.Complaints />], ['content', <Pl.ContentModeration />], ['ai-review', <Pl.AiReview />], ['suspended', <Pl.Suspended />],
+    ['', <Pl.ModeratorDashboard />], ['users', <Pl.AdminUsers />], ['verification', <Pl.ProviderVerification />],
+    ['complaints', <Pl.Complaints />], ['content', <Pl.ContentModeration />], ['suspended', <Pl.Suspended />],
   ],
   COMPLIANCE_OFFICER: [
     ['', <Pl.ComplianceDashboard />], ['audit', <Pl.AuditTrail />], ['break-glass', <Pl.BreakGlassReviews />], ['consents', <Pl.ConsentRegistry />],
@@ -76,6 +78,7 @@ const SCREENS = {
   ],
   SUPER_ADMIN: [
     ['', <Pl.AdminDashboard />], ['users', <Pl.AdminUsers />], ['roles', <Pl.RolesMatrix />], ['facilities', <Pl.AdminFacilities />],
+    ['verification', <Pl.ProviderVerification />], ['ai-review', <Pl.AiReview />],
     ['hmos', <Pl.AdminHmos />], ['integrations', <Pl.Integrations />], ['ai', <Pl.AiModels />], ['security', <Pl.SecuritySettings />],
     ['system', <Pl.SystemHealth />], ['audit', <Pl.PlatformAudit />],
   ],
@@ -85,8 +88,16 @@ const SHARED = [
   ['messages', <Shared.Messages />], ['notifications', <Shared.Notifications />], ['settings', <Shared.Settings />], ['help', <Shared.Help />],
 ]
 
+/* Shows a toast when the server refuses a change (it's rolled back on screen). */
+function StoreErrors() {
+  const toast = useToast()
+  useEffect(() => onStoreError((err) => toast(err.message ?? 'Something went wrong', 'error')), [toast])
+  return null
+}
+
 function HomeRedirect() {
-  const { user } = useAuth()
+  const { user, loading } = useAuth()
+  if (loading) return null
   return <Navigate to={user ? homeFor(user.role) : '/login'} replace />
 }
 
@@ -95,6 +106,7 @@ export default function App() {
     <BrowserRouter>
       <AuthProvider>
         <ToastProvider>
+          <StoreErrors />
           <Routes>
             <Route path="/" element={<Landing />} />
             <Route path="/login" element={<Auth.Login />} />

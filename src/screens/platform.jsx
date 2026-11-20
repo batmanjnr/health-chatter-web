@@ -1,34 +1,39 @@
 /* Moderator, Compliance Officer (DPO) and Super Admin screens. */
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext.jsx'
 import { PERMISSIONS, ROLES, ROLE_KEYS } from '../config/roles.js'
 import { db, fmtDate, useCollection } from '../lib/store.js'
+import { useApi } from '../lib/api.js'
+import { docId, docName, openFile } from '../lib/files.js'
+import { downloadCsv } from '../lib/exportCsv.js'
+import { avg, countByDay, daysBetween, fmtDuration, inMonth, lastDays, minutesBetween, monthLabel, pct, sameDay, sumBy, timeAgo } from '../lib/stats.js'
 import {
   Alert, Badge, BarChart, Button, Card, Field, Grid, Icon, KeyValue, List, Modal, PageHeader,
-  SearchInput, Sparkline, StatGrid, Table, Tabs, Toggle, filterRows, useToast,
+  SearchInput, Sparkline, StatGrid, Table, Tabs, Toggle, filterRows, useToast, DeleteButton,
 } from '../components/ui/index.jsx'
 
 const audit = (user, action, resource) =>
-  db.add('auditLog', { at: new Date().toISOString(), actor: user.name, role: user.role, action, resource, ip: '102.89.1.5', facility: 'Platform' })
+  db.add('auditLog', { at: new Date().toISOString(), actor: user.name, role: user.role, action, resource, facility: 'Platform' })
 
 /* ===================================================================== */
 /*                                MODERATOR                              */
 /* ===================================================================== */
 export function ModeratorDashboard() {
+  const { user } = useAuth()
   const [v] = useCollection('verifications')
-  const [f] = useCollection('facilities')
+  const [accounts] = useCollection('accounts')
   const [c] = useCollection('complaints')
-  const [ai] = useCollection('aiFlags')
+  const [sus] = useCollection('suspended')
   const [rv] = useCollection('reviews')
   return (
     <>
-      <PageHeader title="Trust & Safety" subtitle="Keep Healthchatter safe: only verified professionals, fair content, safe AI." />
+      <PageHeader title="Trust & Safety" subtitle={`${user.facility ?? 'Your hospital'} — only verified professionals and fair content.`} />
       <StatGrid items={[
         { label: 'Providers to verify', value: v.filter((x) => x.status === 'PENDING').length, icon: 'BadgeCheck', tone: 'teal' },
-        { label: 'Facilities to verify', value: f.filter((x) => x.status === 'PENDING').length, icon: 'Hospital', tone: 'blue' },
+        { label: 'Staff accounts', value: accounts.filter((x) => x.id !== user.id).length, icon: 'Users', tone: 'blue' },
         { label: 'Open complaints', value: c.filter((x) => x.status !== 'RESOLVED').length, icon: 'Flag', tone: 'pink' },
-        { label: 'AI chats to review', value: ai.filter((x) => x.status === 'NEEDS_REVIEW').length, icon: 'Brain', tone: 'yellow' },
+        { label: 'Suspended', value: sus.length, icon: 'UserX', tone: 'yellow' },
       ]} />
       <Grid>
         <Card title="Verification queue" action={<Link to="/moderator/verification">Open</Link>}>
@@ -52,10 +57,10 @@ export function ProviderVerification() {
   const [tab, setTab] = useState('PENDING')
   const decide = (status) => {
     api.update(sel.id, { status, note })
-    const a = accounts.find((x) => x.name === sel.name)
+    const a = accounts.find((x) => x.id === sel.userId)
     if (a) acc.update(a.id, { status: status === 'APPROVED' ? 'ACTIVE' : 'PENDING_VERIFICATION' })
     audit(user, status === 'APPROVED' ? 'VERIFY' : 'REJECT', `${sel.regulator} ${sel.license} — ${sel.name}`)
-    toast(status === 'APPROVED' ? `${sel.name} verified — workspace unlocked` : `${sel.name} rejected — reason emailed`, status === 'APPROVED' ? 'success' : 'error')
+    toast(status === 'APPROVED' ? `${sel.name} verified — workspace unlocked` : `${sel.name} rejected — applicant notified`, status === 'APPROVED' ? 'success' : 'error')
     setSel(null); setNote('')
   }
   return (
@@ -71,7 +76,7 @@ export function ProviderVerification() {
       </Card>
       <Modal open={!!sel} title={sel?.name} onClose={() => setSel(null)} wide footer={sel?.status === 'PENDING' && (
         <div className="row-actions">
-          <Button variant="ghost" onClick={() => { toast('More information requested'); setSel(null) }}>Request more info</Button>
+          <Button variant="ghost" disabled={!note} onClick={() => { api.update(sel.id, { status: 'INFO_REQUESTED', note }); audit(user, 'UPDATE', `More info requested — ${sel.name}`); setSel(null); setNote(''); toast('More information requested — applicant notified') }}>Request more info</Button>
           <Button variant="danger" disabled={!note} onClick={() => decide('REJECTED')}>Reject</Button>
           <Button onClick={() => decide('APPROVED')}>Approve</Button>
         </div>
@@ -80,7 +85,7 @@ export function ProviderVerification() {
           <KeyValue items={[['Role', ROLES[sel?.role]?.label], ['Regulator', sel?.regulator], ['Licence no.', sel?.license], ['Specialty', sel?.specialty], ['Submitted', fmtDate(sel?.submitted, true)]]} />
           <div>
             <h3 className="sub">Documents</h3>
-            <List items={(sel?.docs ?? []).map((d) => ({ id: d, icon: 'FileText', title: d, right: <Button size="sm" variant="ghost">View</Button> }))} />
+            <List empty="No documents uploaded." items={(sel?.docs ?? []).map((d) => ({ id: docId(d) ?? docName(d), icon: 'FileText', title: docName(d), right: docId(d) ? <Button size="sm" variant="ghost" onClick={() => openFile(docId(d)).catch((err) => toast(err.message, 'error'))}>View</Button> : <small className="muted">Name only</small> }))} />
           </div>
         </Grid>
         {sel && (sel.registryMatch
@@ -134,7 +139,7 @@ export function Complaints() {
           <Button variant="ghost" onClick={() => { api.update(sel.id, { status: 'INVESTIGATING' }); setSel(null); toast('Investigation opened') }}>Investigate</Button>
           <Button variant="ghost" onClick={() => { api.update(sel.id, { status: 'ESCALATED' }); setSel(null); toast('Escalated to Clinical Governance Committee') }}>Escalate</Button>
           {sel.against !== 'Platform' && <Button variant="danger" onClick={() => { sus.add({ name: sel.against, role: 'PROVIDER', reason: sel.category, since: new Date().toISOString(), until: 'Under review' }); api.update(sel.id, { status: 'RESOLVED' }); setSel(null); toast('Account suspended', 'error') }}>Suspend</Button>}
-          <Button onClick={() => { api.update(sel.id, { status: 'RESOLVED' }); setSel(null); toast('Resolved — both parties notified') }}>Resolve</Button>
+          <Button onClick={() => { api.update(sel.id, { status: 'RESOLVED', resolvedAt: new Date().toISOString() }); setSel(null); toast('Resolved') }}>Resolve</Button>
         </div>
       )}>
         <KeyValue items={[['From', sel?.from], ['About', sel?.against], ['Received', fmtDate(sel?.at, true)], ['Severity', <Badge key="s">{sel?.severity}</Badge>]]} />
@@ -219,6 +224,13 @@ export function ComplianceDashboard() {
   const [dsr] = useCollection('dataRequests')
   const [inc] = useCollection('incidents')
   const [pr] = useCollection('processors')
+  const [log] = useCollection('auditLog')
+  const [checklist] = useCollection('complianceChecklist')
+  const week = lastDays(7)
+  const inWeek = (iso) => iso && new Date(iso) >= week[0]
+  const access = week.map((d) => log.filter((l) => sameDay(l.at, d)).length)
+  const denied = log.filter((l) => l.action === 'DENIED' && inWeek(l.at)).length
+  const glassCount = log.filter((l) => l.action === 'BREAK_GLASS' && inWeek(l.at)).length
   return (
     <>
       <PageHeader title="Data Protection" subtitle="Nigeria Data Protection Act 2023 — controller of major importance (NDPC registration)." />
@@ -230,11 +242,11 @@ export function ComplianceDashboard() {
       ]} />
       <Grid>
         <Card title="Compliance checklist">
-          {[['NDPC registration', true], ['Privacy notice published', true], ['DPIA — telemedicine', true], ['DPIA — AI assistant', false], ['Data retention policy', true], ['Breach response plan tested', false], ['Annual NDPA audit filed', false]].map(([l, ok]) => (
+          {[...checklist].sort((a, b) => (a.order ?? 0) - (b.order ?? 0)).map((c) => [c.item, c.done]).map(([l, ok]) => (
             <div key={l} className="check-row"><span className={ok ? 'text-ok' : 'text-warn'}><Icon name={ok ? 'CircleCheck' : 'CircleAlert'} size={16} /></span> {l}</div>
           ))}
         </Card>
-        <Card title="Record access (last 7 days)"><Sparkline points={[1220, 1310, 1288, 1402, 1350, 980, 760]} height={90} /><p className="muted">3 denied attempts · 1 break-glass</p></Card>
+        <Card title="Record access (last 7 days)"><Sparkline points={access} height={90} /><p className="muted">{denied} denied attempts · {glassCount} break-glass</p></Card>
       </Grid>
     </>
   )
@@ -246,7 +258,7 @@ export function AuditTrail() {
   const [action, setAction] = useState('All')
   return (
     <>
-      <PageHeader title="Audit Trail" subtitle="Immutable log: who accessed a record → when → what they accessed → what they changed." actions={<Button variant="ghost" icon="Download">Export</Button>} />
+      <PageHeader title="Audit Trail" subtitle="Immutable log: who accessed a record → when → what they accessed → what they changed." actions={<Button variant="ghost" icon="Download" onClick={() => downloadCsv('audit-trail', rows, ['at', 'actor', 'role', 'action', 'resource', 'ip', 'facility'])}>Export</Button>} />
       <div className="toolbar">
         <SearchInput value={q} onChange={setQ} placeholder="Staff, patient or resource" />
         <Field label="Action" as="select" options={['All', 'VIEW', 'UPDATE', 'RELEASE', 'DISPENSE', 'BREAK_GLASS', 'DENIED', 'ROLE_CHANGE', 'VERIFY']} value={action} onChange={(e) => setAction(e.target.value)} />
@@ -271,7 +283,7 @@ export function BreakGlassReviews() {
         <Table rows={rows} columns={[
           { label: 'When', render: (r) => fmtDate(r.at, true) }, { label: 'Staff', key: 'actor' }, { label: 'Patient', key: 'patient' }, { label: 'Reason given', key: 'reason' },
           { label: 'Status', render: (r) => <Badge>{r.status}</Badge> },
-          { label: '', render: (r) => r.status === 'PENDING_REVIEW' && <div className="row-actions"><Button size="sm" onClick={() => { api.update(r.id, { status: 'JUSTIFIED' }); toast('Marked justified') }}>Justified</Button><Button size="sm" variant="danger" onClick={() => { api.update(r.id, { status: 'DENIED' }); toast('Flagged — HR & facility admin notified', 'error') }}>Not justified</Button></div> },
+          { label: '', render: (r) => r.status === 'PENDING_REVIEW' && <div className="row-actions"><Button size="sm" onClick={() => { api.update(r.id, { status: 'JUSTIFIED' }); toast('Marked justified') }}>Justified</Button><Button size="sm" variant="danger" onClick={() => { api.update(r.id, { status: 'DENIED' }); toast('Flagged for review', 'error') }}>Not justified</Button></div> },
         ]} />
       </Card>
     </>
@@ -359,7 +371,7 @@ export function Processors() {
         <Table rows={rows} columns={[
           { label: 'Vendor', render: (r) => <b>{r.vendor}</b> }, { label: 'Purpose', key: 'purpose' }, { label: 'Data location', key: 'location' }, { label: 'Transfer safeguard', key: 'transfer' },
           { label: 'DPA', render: (r) => <Badge>{r.dpa}</Badge> },
-          { label: '', render: (r) => r.dpa !== 'SIGNED' && <Button size="sm" variant="ghost" onClick={() => { api.update(r.id, { dpa: 'SIGNED' }); toast('DPA recorded') }}>Mark signed</Button> },
+          { label: '', render: (r) => <div className="row-actions">{r.dpa !== 'SIGNED' && <Button size="sm" variant="ghost" onClick={() => { api.update(r.id, { dpa: 'SIGNED' }); toast('DPA recorded') }}>Mark signed</Button>}<DeleteButton what={r.vendor} onConfirm={() => api.remove(r.id)} /></div> },
         ]} />
       </Card>
     </>
@@ -373,17 +385,20 @@ export function AdminDashboard() {
   const [accounts] = useCollection('accounts')
   const [facilities] = useCollection('facilities')
   const [ig] = useCollection('integrations')
+  const stats = useApi('/web/stats/platform')
+  const ch = stats?.channels ?? {}
+  const chTotal = (ch.WEB ?? 0) + (ch.APP ?? 0)
   return (
     <>
       <PageHeader title="Platform Overview" subtitle="Healthchatter Core + Connect" />
       <StatGrid items={[
-        { label: 'Registered patients', value: '48,210', hint: '+1,204 this week', icon: 'Users', tone: 'teal' },
-        { label: 'Verified providers', value: '1,382', icon: 'BadgeCheck', tone: 'blue' },
+        { label: 'Registered patients', value: stats ? stats.patients.toLocaleString('en-NG') : '…', hint: stats ? `+${stats.newPatientsThisWeek} this week` : undefined, icon: 'Users', tone: 'teal' },
+        { label: 'Verified providers', value: stats ? stats.verifiedProviders.toLocaleString('en-NG') : '…', icon: 'BadgeCheck', tone: 'blue' },
         { label: 'Facilities live', value: facilities.filter((f) => f.status === 'VERIFIED').length, icon: 'Hospital', tone: 'pink' },
-        { label: 'API uptime (30d)', value: '99.93%', icon: 'Server', tone: 'yellow' },
+        { label: 'API server uptime', value: stats ? fmtDuration(stats.server.uptimeSeconds) : '…', hint: 'since last restart', icon: 'Server', tone: 'yellow' },
       ]} />
       <Grid>
-        <Card title="Daily active users"><BarChart data={['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((d, i) => ({ label: d, value: [8.2, 8.9, 9.1, 9.6, 10.2, 6.1, 4.8][i] }))} /></Card>
+        <Card title="Daily active users"><BarChart data={(stats?.dailyActive ?? []).map((d) => ({ label: new Date(d.day).toLocaleDateString('en-NG', { weekday: 'short' }), value: d.users }))} /></Card>
         <Card title="Accounts by role">
           <List items={ROLE_KEYS.map((r) => ({ id: r, icon: 'User', title: ROLES[r].label, right: <b>{accounts.filter((a) => a.role === r).length}</b> }))} />
         </Card>
@@ -391,7 +406,7 @@ export function AdminDashboard() {
           <List items={ig.map((i) => ({ id: i.id, icon: 'Plug', title: i.name, subtitle: i.latency, right: <Badge>{i.status}</Badge> }))} />
         </Card>
         <Card title="Channels">
-          <KeyValue items={[['Web', '41%'], ['Android', '38%'], ['iOS', '9%'], ['USSD *347*24#', '8%'], ['SMS', '4%']]} />
+          <KeyValue items={[['Website', `${pct(ch.WEB ?? 0, chTotal)}% · ${ch.WEB ?? 0} users`], ['Mobile app', `${pct(ch.APP ?? 0, chTotal)}% · ${ch.APP ?? 0} users`]]} />
         </Card>
       </Grid>
     </>
@@ -400,16 +415,56 @@ export function AdminDashboard() {
 
 export function AdminUsers() {
   const toast = useToast()
-  const { user } = useAuth()
+  const { user, inviteUser, sendPasswordReset } = useAuth()
   const [rows, api] = useCollection('accounts')
+  const [verifs, vapi] = useCollection('verifications')
+  const [ver, setVer] = useState(null) // account being verified
+  const [vf, setVf] = useState({ license: '', note: '' })
+  // Licensed staff (doctors, nurses, pharmacists, lab scientists, CHWs) need their
+  // licence checked; everyone else shows "Not required".
+  const licensed = (r) => !!ROLES[r]?.regulator
+  const verOf = (a) => verifs.find((x) => x.userId === a.id)
+  const licenceStatus = (a) => {
+    if (!licensed(a.role)) return 'NOT_REQUIRED'
+    const v = verOf(a)
+    if (v?.status === 'APPROVED') return 'VERIFIED'
+    if (v?.status === 'REJECTED') return 'REJECTED'
+    return v || a.status === 'PENDING_VERIFICATION' ? 'PENDING' : 'NOT_VERIFIED'
+  }
+  const openVerify = (a) => {
+    setVf({ license: a.license ?? (verOf(a)?.license !== '—' ? verOf(a)?.license ?? '' : ''), note: '' })
+    setVer(a)
+  }
+  const decideLicence = (approve) => {
+    const a = ver
+    const v = verOf(a)
+    const now = new Date().toISOString()
+    const record = { status: approve ? 'APPROVED' : 'REJECTED', license: vf.license, note: vf.note || undefined, verifiedBy: user.name, verifiedAt: now }
+    if (v) vapi.update(v.id, record)
+    else vapi.add({ userId: a.id, name: a.name, role: a.role, regulator: ROLES[a.role].regulator, specialty: a.specialty ?? '—', submitted: now, docs: [], ...record })
+    api.update(a.id, { license: vf.license, ...(a.id !== user.id && { status: approve ? 'ACTIVE' : 'PENDING_VERIFICATION' }) })
+    audit(user, approve ? 'VERIFY' : 'REJECT', `${ROLES[a.role].regulator} ${vf.license} — ${a.name}`)
+    setVer(null)
+    toast(approve ? `${a.name} verified — account active` : `${a.name} rejected — account on hold`, approve ? 'success' : 'error')
+  }
   const [q, setQ] = useState('')
   const [role, setRole] = useState('All')
   const [sel, setSel] = useState(null)
   const [open, setOpen] = useState(false)
-  const [f, setF] = useState({ name: '', email: '', role: 'MODERATOR' })
+  const [facilities] = useCollection('facilities')
+  const isSuper = user.role === 'SUPER_ADMIN'
+  // Super Admin creates any staff role (incl. each hospital's moderator);
+  // a hospital moderator creates staff for their own hospital only.
+  const creatable = isSuper
+    ? ROLE_KEYS.filter((r) => r !== 'PATIENT')
+    : ['DOCTOR', 'NURSE', 'RECEPTIONIST', 'BILLING_OFFICER', 'PHARMACIST', 'LAB_SCIENTIST', 'CHW', 'FACILITY_ADMIN']
+  const hospitalBound = (r) => !['SUPER_ADMIN', 'COMPLIANCE_OFFICER', 'CLAIMS_OFFICER', 'PATIENT'].includes(r)
+  const hospitals = facilities.filter((x) => x.status === 'VERIFIED').map((x) => x.name)
+  const [f, setF] = useState({ name: '', email: '', role: isSuper ? 'MODERATOR' : 'DOCTOR', facility: '' })
+  const facilityChoice = f.facility || hospitals[0] || ''
   return (
     <>
-      <PageHeader title="Users" subtitle="Platform roles (Moderator, Compliance, Claims Officer, Super Admin) can only be created here." actions={<Button icon="UserPlus" onClick={() => setOpen(true)}>Create user</Button>} />
+      <PageHeader title={isSuper ? 'Users' : 'Staff Accounts'} subtitle={isSuper ? 'Create each hospital\'s moderator here. Moderators then create their own hospital\'s staff.' : `Create and manage staff accounts for ${user.facility}.`} actions={<Button icon="UserPlus" onClick={() => setOpen(true)}>Create user</Button>} />
       <div className="toolbar">
         <SearchInput value={q} onChange={setQ} />
         <Field label="Role" as="select" options={[{ value: 'All', label: 'All roles' }, ...ROLE_KEYS.map((r) => ({ value: r, label: ROLES[r].label }))]} value={role} onChange={(e) => setRole(e.target.value)} />
@@ -419,6 +474,15 @@ export function AdminUsers() {
           { label: 'Name', render: (r) => <span><b>{r.name}</b><small className="block muted">{r.email}</small></span> }, { label: 'Role', render: (r) => ROLES[r.role]?.label },
           { label: 'Organisation', render: (r) => r.facility ?? r.payer ?? '—' }, { label: 'MFA', render: (r) => ROLES[r.role]?.mfa ? <Badge tone="green">Required</Badge> : <Badge tone="gray">Optional</Badge> },
           { label: 'Status', render: (r) => <Badge>{r.status}</Badge> },
+          { label: 'Licence', render: (r) => {
+            const st = licenceStatus(r)
+            return (
+              <div className="row-actions" onClick={(e) => e.stopPropagation()}>
+                <Badge tone={st === 'VERIFIED' ? 'green' : st === 'NOT_REQUIRED' ? 'gray' : st === 'REJECTED' ? 'red' : 'amber'}>{st}</Badge>
+                {st !== 'VERIFIED' && st !== 'NOT_REQUIRED' && r.id !== user.id && <Button size="sm" icon="BadgeCheck" onClick={() => openVerify(r)}>Verify</Button>}
+              </div>
+            )
+          } },
         ]} />
       </Card>
       <Modal open={!!sel} title={sel?.name} onClose={() => setSel(null)} footer={sel && sel.id !== user.id && (
@@ -426,17 +490,34 @@ export function AdminUsers() {
           {sel.status === 'SUSPENDED'
             ? <Button onClick={() => { api.update(sel.id, { status: 'ACTIVE' }); audit(user, 'UPDATE', `User ${sel.name} reactivated`); setSel(null); toast('Reactivated') }}>Reactivate</Button>
             : <Button variant="danger" onClick={() => { api.update(sel.id, { status: 'SUSPENDED' }); audit(user, 'UPDATE', `User ${sel.name} suspended`); setSel(null); toast('Suspended — sessions revoked', 'error') }}>Suspend</Button>}
-          <Button variant="ghost" onClick={() => { toast('Password reset link sent'); setSel(null) }}>Reset password</Button>
+          <Button variant="ghost" onClick={() => { sendPasswordReset(sel.email).then(() => toast('Password reset link sent'), (err) => toast(err.message, 'error')); setSel(null) }}>Reset password</Button>
         </div>
       )}>
         <KeyValue items={[['Email', sel?.email], ['Phone', sel?.phone], ['Role', ROLES[sel?.role]?.label], ['Status', <Badge key="s">{sel?.status}</Badge>]]} />
-        <Field label="Change role" as="select" options={ROLE_KEYS.map((r) => ({ value: r, label: ROLES[r].label }))} value={sel?.role ?? ''} onChange={(e) => { api.update(sel.id, { role: e.target.value }); audit(user, 'ROLE_CHANGE', `User ${sel.name} → ${e.target.value}`); setSel({ ...sel, role: e.target.value }); toast('Role changed — logged') }} hint="Every role change is recorded in the platform audit log." />
+        <Field label="Change role" as="select" options={(isSuper ? ROLE_KEYS : creatable).map((r) => ({ value: r, label: ROLES[r].label }))} value={sel?.role ?? ''} onChange={(e) => { api.update(sel.id, { role: e.target.value }); audit(user, 'ROLE_CHANGE', `User ${sel.name} → ${e.target.value}`); setSel({ ...sel, role: e.target.value }); toast('Role changed — logged') }} hint="Every role change is recorded in the platform audit log." />
       </Modal>
-      <Modal open={open} title="Create user" onClose={() => setOpen(false)} footer={<Button onClick={() => { api.add({ ...f, status: 'ACTIVE', phone: '' }); audit(user, 'ROLE_CHANGE', `Created ${f.name} as ${f.role}`); setOpen(false); toast('User created — invite emailed') }}>Create & invite</Button>}>
+      <Modal open={!!ver} title={`Verify ${ver?.name ?? ''}`} onClose={() => setVer(null)} footer={ver && (
+        <div className="row-actions">
+          <Button variant="ghost" onClick={() => decideLicence(false)}>Reject</Button>
+          <Button icon="BadgeCheck" disabled={!vf.license.trim()} onClick={() => decideLicence(true)}>Approve licence</Button>
+        </div>
+      )}>
+        <div className="form">
+          <KeyValue items={[['Role', ROLES[ver?.role]?.label], ['Regulator', ROLES[ver?.role]?.regulator], ['Hospital', ver?.facility ?? '—'], ['Email', ver?.email]]} />
+          {ver && verOf(ver)?.docs?.length > 0 && <List items={verOf(ver).docs.map((d) => ({ id: d, icon: 'FileCheck', title: d }))} />}
+          <Field label={`${ROLES[ver?.role]?.regulator ?? ''} licence number`} value={vf.license} onChange={(e) => setVf({ ...vf, license: e.target.value })} hint="Check it against the regulator's register before approving." />
+          <Field label="Note (shown to the staff member if rejected)" as="textarea" value={vf.note} onChange={(e) => setVf({ ...vf, note: e.target.value })} />
+          <Alert tone="info">Approving activates the account. Rejecting keeps it on hold until a valid licence is provided.</Alert>
+        </div>
+      </Modal>
+      <Modal open={open} title="Create user" onClose={() => setOpen(false)} footer={<Button onClick={() => inviteUser({ name: f.name, email: f.email, role: f.role, facility: isSuper && hospitalBound(f.role) ? facilityChoice : undefined }).then(() => { db.refresh(); audit(user, 'ROLE_CHANGE', `Created ${f.name} as ${f.role}`); setOpen(false); toast('User created — invite emailed') }, (err) => toast(err.message, 'error'))}>Create & invite</Button>}>
         <div className="form">
           <Field label="Full name" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} />
           <Field label="Email" type="email" value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} />
-          <Field label="Role" as="select" options={ROLE_KEYS.map((r) => ({ value: r, label: ROLES[r].label }))} value={f.role} onChange={(e) => setF({ ...f, role: e.target.value })} />
+          <Field label="Role" as="select" options={creatable.map((r) => ({ value: r, label: ROLES[r].label }))} value={f.role} onChange={(e) => setF({ ...f, role: e.target.value })} />
+          {isSuper && hospitalBound(f.role) && (
+            <Field label="Hospital" as="select" options={hospitals} value={facilityChoice} onChange={(e) => setF({ ...f, facility: e.target.value })} hint="The account will only see this hospital's data." />
+          )}
         </div>
       </Modal>
     </>
@@ -481,7 +562,7 @@ export function AdminFacilities() {
       <Card pad={false}>
         <Table rows={filterRows(rows, q, ['name', 'type', 'state'])} columns={[
           { label: 'Facility', render: (r) => <b>{r.name}</b> }, { label: 'Type', key: 'type' }, { label: 'State', key: 'state' }, { label: 'Staff', key: 'staff' },
-          { label: 'Mode', render: (r) => r.staff > 100 ? 'Edge server + cloud' : 'Cloud' }, { label: 'Status', render: (r) => <Badge>{r.status}</Badge> },
+          { label: 'Status', render: (r) => <Badge>{r.status}</Badge> },
         ]} />
       </Card>
     </>
@@ -502,7 +583,7 @@ export function AdminHmos() {
         </form>
       </Card>
       <Card pad={false}>
-        <Table rows={rows} columns={[{ label: 'Payer', render: (r) => <b>{r.name}</b> }, { label: 'Type', key: 'type' }, { label: 'Enrollees', key: 'enrollees' }, { label: 'Integration', render: (r) => <Badge tone={r.integration === 'API' ? 'green' : r.integration === 'Pending' ? 'amber' : 'blue'}>{r.integration}</Badge> }, { label: 'NHIA accredited', render: (r) => r.accredited ? <Badge tone="green">Yes</Badge> : <Badge tone="red">No</Badge> }]} />
+        <Table rows={rows} columns={[{ label: 'Payer', render: (r) => <b>{r.name}</b> }, { label: 'Type', key: 'type' }, { label: 'Enrollees', key: 'enrollees' }, { label: 'Integration', render: (r) => <Badge tone={r.integration === 'API' ? 'green' : r.integration === 'Pending' ? 'amber' : 'blue'}>{r.integration}</Badge> }, { label: 'NHIA accredited', render: (r) => r.accredited ? <Badge tone="green">Yes</Badge> : <Badge tone="red">No</Badge> }, { label: '', render: (r) => <DeleteButton what={r.name} onConfirm={() => api.remove(r.id)} /> }]} />
       </Card>
     </>
   )
@@ -519,8 +600,8 @@ export function Integrations() {
           <Card key={i.id} title={i.name} action={<Badge>{i.status}</Badge>}>
             <KeyValue items={[['Latency', i.latency]]} />
             <div className="row-actions">
-              <Button size="sm" variant="ghost" onClick={() => toast(`${i.name}: test call OK`)}>Test</Button>
-              {i.status === 'NOT_CONFIGURED' && <Button size="sm" onClick={() => { api.update(i.id, { status: 'CONNECTED', latency: '350ms' }); toast('Connected') }}>Configure</Button>}
+              <Button size="sm" variant="ghost" onClick={() => toast(i.status === 'CONNECTED' ? `${i.name} is connected` : `${i.name} isn't connected yet — no credentials are set on the server`, i.status === 'CONNECTED' ? 'success' : 'error')}>Test</Button>
+              {i.status === 'NOT_CONFIGURED' && <Button size="sm" onClick={() => { api.update(i.id, { status: 'PENDING_SETUP', requestedAt: new Date().toISOString() }); toast('Marked for setup — add its credentials on the server') }}>Configure</Button>}
             </div>
           </Card>
         ))}
@@ -539,7 +620,8 @@ export function AiModels() {
         <Table rows={rows} columns={[
           { label: 'Model', render: (r) => <b>{r.name} {r.version}</b> }, { label: 'Provider', key: 'provider' }, { label: 'Guardrails', key: 'guardrails' },
           { label: 'Deployed', render: (r) => fmtDate(r.deployed) }, { label: 'Stage', render: (r) => <Badge>{r.status}</Badge> },
-          { label: '', render: (r) => r.status === 'STAGING' && <Button size="sm" onClick={() => { rows.filter((x) => x.name === r.name && x.status === 'PRODUCTION').forEach((x) => api.update(x.id, { status: 'RETIRED' })); api.update(r.id, { status: 'PRODUCTION' }); toast('Promoted to production — Clinical Governance notified') }}>Promote</Button> },
+          { label: '', render: (r) => r.status === 'STAGING' && <Button size="sm" onClick={() => { rows.filter((x) => x.name === r.name && x.status === 'PRODUCTION').forEach((x) => api.update(x.id, { status: 'RETIRED' })); api.update(r.id, { status: 'PRODUCTION' }); toast('Promoted to production') }}>Promote</Button> },
+          { label: '', render: (r) => <DeleteButton what={`${r.name} ${r.version}`} onConfirm={() => api.remove(r.id)} /> },
         ]} />
       </Card>
       <Card title="Safety settings">
@@ -553,10 +635,21 @@ export function AiModels() {
 
 export function SecuritySettings() {
   const toast = useToast()
+  const [settings, settingsApi] = useCollection('platformSettings')
+  const saved = settings.find((r) => r.id === 'security')
   const [s, setS] = useState({ mfaStaff: true, mfaPatients: false, session: '30', lockout: '5', ipAllow: false, pw: '10' })
+  useEffect(() => {
+    if (saved) setS((cur) => ({ ...cur, ...saved }))
+  }, [saved])
+  const save = () => {
+    const { mfaStaff, mfaPatients, session, lockout, ipAllow, pw } = s
+    if (saved) settingsApi.update('security', { mfaStaff, mfaPatients, session, lockout, ipAllow, pw })
+    else settingsApi.add({ id: 'security', mfaStaff, mfaPatients, session, lockout, ipAllow, pw })
+    toast('Security policy saved')
+  }
   return (
     <>
-      <PageHeader title="Security Settings" actions={<Button onClick={() => toast('Security policy saved')}>Save policy</Button>} />
+      <PageHeader title="Security Settings" actions={<Button onClick={save}>Save policy</Button>} />
       <Grid>
         <Card title="Authentication">
           <Toggle label="Require MFA for all staff roles" checked={s.mfaStaff} onChange={(v) => setS({ ...s, mfaStaff: v })} />
@@ -567,7 +660,7 @@ export function SecuritySettings() {
         <Card title="Sessions & access">
           <Field label="Idle timeout for staff (minutes)" type="number" value={s.session} onChange={(e) => setS({ ...s, session: e.target.value })} />
           <Toggle label="Restrict admin access to office IP ranges" checked={s.ipAllow} onChange={(v) => setS({ ...s, ipAllow: v })} />
-          <KeyValue items={[['Encryption in transit', 'TLS 1.3'], ['Encryption at rest', 'AES-256'], ['Last penetration test', '12 Sep 2026'], ['Next scheduled', '12 Mar 2027']]} />
+          <KeyValue items={[['Encryption in transit', 'TLS 1.3'], ['Encryption at rest', 'AES-256'], ['Last penetration test', saved?.lastPenTest ? fmtDate(saved.lastPenTest) : 'Not recorded'], ['Next scheduled', saved?.nextPenTest ? fmtDate(saved.nextPenTest) : 'Not scheduled']]} />
         </Card>
       </Grid>
     </>
@@ -575,22 +668,23 @@ export function SecuritySettings() {
 }
 
 export function SystemHealth() {
+  const sys = useApi('/web/stats/system')
+  const [sync] = useCollection('syncQueue')
   return (
     <>
       <PageHeader title="System Health" />
       <StatGrid items={[
-        { label: 'API p95 latency', value: '210 ms', icon: 'Activity', tone: 'teal' },
-        { label: 'Error rate', value: '0.08%', icon: 'CircleAlert', tone: 'blue' },
-        { label: 'Offline syncs pending', value: '1,204', icon: 'RefreshCw', tone: 'yellow' },
-        { label: 'Last backup', value: '02:00 today', icon: 'Database', tone: 'pink' },
+        { label: 'API p95 latency', value: sys?.p95LatencyMs != null ? `${sys.p95LatencyMs} ms` : '—', hint: 'last hour', icon: 'Activity', tone: 'teal' },
+        { label: 'Error rate', value: sys ? `${(sys.errorRate * 100).toFixed(2)}%` : '—', hint: sys ? `${sys.requestsLastHour} requests in the last hour` : undefined, icon: 'CircleAlert', tone: 'blue' },
+        { label: 'Offline syncs pending', value: sync.filter((x) => x.status === 'QUEUED').length, icon: 'RefreshCw', tone: 'yellow' },
+        { label: 'Last backup', value: 'Not connected', hint: 'Backups are managed in Supabase', icon: 'Database', tone: 'pink' },
       ]} />
       <Grid>
-        <Card title="Requests per minute"><Sparkline points={[820, 900, 1100, 1300, 1250, 1400, 1380, 1200, 990]} height={100} /></Card>
+        <Card title="Requests per minute"><Sparkline points={sys?.requestsPerMinute ?? []} height={100} /></Card>
         <Card title="Environments">
           <List items={[
-            { id: 'p', icon: 'Server', title: 'Production', subtitle: 'Lagos (primary) · Johannesburg (DR)', right: <Badge tone="green">Healthy</Badge> },
-            { id: 's', icon: 'Server', title: 'Staging', subtitle: 'v2.14.0-rc2', right: <Badge tone="green">Healthy</Badge> },
-            { id: 'e', icon: 'Server', title: 'Facility edge servers', subtitle: '23 of 24 online', right: <Badge tone="amber">1 offline</Badge> },
+            { id: 'api', icon: 'Server', title: 'API server', subtitle: sys ? `Node ${sys.nodeVersion} · up ${fmtDuration(sys.uptimeSeconds)}` : 'Not reachable', right: sys ? <Badge tone="green">Healthy</Badge> : <Badge tone="red">Down</Badge> },
+            { id: 'db', icon: 'Database', title: 'Database (Supabase Postgres)', subtitle: sys?.dbLatencyMs != null ? `${sys.dbLatencyMs} ms query time` : 'Not reachable', right: sys?.dbLatencyMs != null ? <Badge tone="green">Healthy</Badge> : <Badge tone="red">Down</Badge> },
           ]} />
         </Card>
       </Grid>

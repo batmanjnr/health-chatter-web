@@ -3,9 +3,11 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext.jsx'
 import { fmtDate, naira, useCollection } from '../lib/store.js'
+import { downloadCsv } from '../lib/exportCsv.js'
+import { avg, countByDay, daysBetween, fmtDuration, inMonth, lastDays, minutesBetween, monthLabel, pct, sameDay, sumBy, timeAgo } from '../lib/stats.js'
 import {
   Alert, Badge, BarChart, Button, Card, Field, Grid, KeyValue, List, Modal, PageHeader,
-  SearchInput, StatGrid, Table, Tabs, Timeline, filterRows, useToast,
+  SearchInput, StatGrid, Table, Tabs, Timeline, filterRows, useToast, DeleteButton,
 } from '../components/ui/index.jsx'
 
 /* ===================================================================== */
@@ -58,7 +60,7 @@ export function RxQueue() {
       <Modal open={!!sel} title={`${sel?.drug} ${sel?.dosage}`} onClose={() => setSel(null)} footer={sel && (
         <div className="row-actions">
           {sel.status === 'NEW' && <Button variant="ghost" onClick={() => { api.update(sel.id, { status: 'QUERIED' }); setSel(null); toast('Query sent to prescriber') }}>Query prescriber</Button>}
-          {sel.status === 'NEW' && <Button onClick={() => { api.update(sel.id, { status: 'READY' }); setSel(null); toast('Prepared — patient notified by SMS') }}>Prepare</Button>}
+          {sel.status === 'NEW' && <Button onClick={() => { api.update(sel.id, { status: 'READY' }); setSel(null); toast('Prepared — patient notified') }}>Prepare</Button>}
           {sel.status === 'READY' && <Button onClick={() => { api.update(sel.id, { status: 'DISPENSED', dispensedBy: user.name }); setSel(null); toast('Dispensed & logged') }}>Dispense</Button>}
         </div>
       )}>
@@ -75,7 +77,7 @@ export function DispensingLog() {
   const [q, setQ] = useState('')
   return (
     <>
-      <PageHeader title="Dispensing Log" subtitle="Immutable record for PCN inspection." actions={<Button variant="ghost" icon="Download">Export CSV</Button>} />
+      <PageHeader title="Dispensing Log" subtitle="Immutable record for PCN inspection." actions={<Button variant="ghost" icon="Download" onClick={() => downloadCsv('dispensing-log', rows.filter((r) => r.status === 'DISPENSED'), ['id', 'at', 'patient', 'drug', 'dosage', 'frequency', 'qty', 'doctor', 'pharmacy', 'dispensedBy'])}>Export CSV</Button>} />
       <div className="toolbar"><SearchInput value={q} onChange={setQ} /></div>
       <Card pad={false}>
         <Table rows={filterRows(rows.filter((r) => r.status === 'DISPENSED'), q, ['patient', 'drug', 'doctor'])} columns={[
@@ -100,7 +102,7 @@ export function Inventory() {
           { label: 'Medication', render: (r) => <b>{r.drug}</b> }, { label: 'Batch', key: 'batch' }, { label: 'Expiry', key: 'expiry' },
           { label: 'Stock', render: (r) => <span className={r.stock < r.reorder ? 'text-danger' : ''}>{r.stock}</span> }, { label: 'Reorder at', key: 'reorder' },
           { label: 'Status', render: (r) => <Badge>{r.stock === 0 ? 'OUT_OF_STOCK' : r.stock < r.reorder ? 'PENDING' : 'OK'}</Badge> },
-          { label: '', render: (r) => <Button size="sm" variant="ghost" onClick={() => setSel(r)}>Receive stock</Button> },
+          { label: '', render: (r) => <div className="row-actions"><Button size="sm" variant="ghost" onClick={() => setSel(r)}>Receive stock</Button><DeleteButton what={r.drug} onConfirm={() => api.remove(r.id)} /></div> },
         ]} />
       </Card>
       <Modal open={!!sel} title={`Receive — ${sel?.drug}`} onClose={() => setSel(null)} footer={<Button onClick={() => { api.update(sel.id, { stock: sel.stock + Number(qty) }); setSel(null); toast('Stock updated') }}>Save</Button>}>
@@ -287,7 +289,7 @@ export function Amendments() {
         <Table rows={rows} columns={[
           { label: 'Patient', key: 'patient' }, { label: 'Test', key: 'test' }, { label: 'Reason', key: 'reason' }, { label: 'Requested by', key: 'requestedBy' },
           { label: 'Status', render: (r) => <Badge>{r.status}</Badge> },
-          { label: '', render: (r) => r.status === 'PENDING_APPROVAL' && r.requestedBy !== user.name && <Button size="sm" onClick={() => { api.update(r.id, { status: 'APPROVED' }); toast('Amendment approved — doctor & patient notified') }}>Approve</Button> },
+          { label: '', render: (r) => r.status === 'PENDING_APPROVAL' && r._owner !== user.id && <Button size="sm" onClick={() => { api.update(r.id, { status: 'APPROVED' }); toast('Amendment approved') }}>Approve</Button> },
         ]} />
       </Card>
       <Modal open={open} title="Request amendment" onClose={() => setOpen(false)} footer={<Button onClick={() => { const o = orders.find((x) => x.id === f.orderId); api.add({ ...f, patient: o?.patient, test: o?.test, requestedBy: user.name, status: 'PENDING_APPROVAL', at: new Date().toISOString() }); setOpen(false); toast('Sent for second signature') }}>Submit</Button>}>
@@ -317,7 +319,7 @@ export function BillingDashboard() {
         { label: 'Claims queried', value: claims.filter((c) => c.status === 'QUERIED').length, icon: 'CircleAlert', tone: 'pink' },
       ]} />
       <Grid>
-        <Card title="Revenue by payer (₦ thousands)"><BarChart data={[{ label: 'Self-pay', value: 83 }, { label: 'AXA', value: 92 }, { label: 'NHIA', value: 15 }, { label: 'Hygeia', value: 40 }, { label: 'Ilera Eko', value: 22 }]} /></Card>
+        <Card title="Revenue by payer (₦ thousands)"><BarChart data={sumBy([...pay.filter((p) => p.status === 'SUCCESS').map((p) => ({ payer: 'Self-pay', amount: p.amount })), ...claims.filter((c) => c.status === 'APPROVED')], (r) => r.payer.split(' (')[0], (r) => r.amount).map((x) => ({ ...x, value: Math.round(x.value / 1000) }))} /></Card>
         <Card title="Needs attention">
           <List items={claims.filter((c) => c.status === 'QUERIED' || c.status === 'REJECTED').map((c) => ({ id: c.id, icon: 'FileWarning', tone: 'red', title: `${c.id} — ${c.enrollee}`, subtitle: c.query, right: <Badge>{c.status}</Badge> }))} empty="Nothing needs attention." />
         </Card>
@@ -327,6 +329,7 @@ export function BillingDashboard() {
 }
 
 export function Invoices() {
+  const { user } = useAuth()
   const toast = useToast()
   const [rows, api] = useCollection('invoices')
   const [, claims] = useCollection('claims')
@@ -342,7 +345,7 @@ export function Invoices() {
           { label: 'Invoice', key: 'id' }, { label: 'Patient', key: 'patient' }, { label: 'Items', key: 'items' }, { label: 'Amount', render: (r) => naira(r.amount) },
           { label: 'Payer', key: 'payer' }, { label: 'Status', render: (r) => <Badge>{r.status}</Badge> },
           { label: '', render: (r) => r.status === 'UNPAID' && r.payer !== 'Self-pay' && <Button size="sm" onClick={() => {
-            claims.add({ invoice: r.id, enrollee: r.patient, enrolleeId: '—', provider: 'LUTH, Idi-Araba', payer: r.payer, amount: r.amount, diagnosis: '—', status: 'SUBMITTED', submittedAt: new Date().toISOString() })
+            claims.add({ invoice: r.id, enrollee: r.patient, enrolleeId: '—', provider: user.facility ?? '—', payer: r.payer, amount: r.amount, diagnosis: '—', status: 'SUBMITTED', submittedAt: new Date().toISOString() })
             api.update(r.id, { status: 'CLAIM_SUBMITTED' }); toast('Claim submitted to payer')
           }}>Submit claim</Button> },
         ]} />
@@ -350,7 +353,7 @@ export function Invoices() {
       <Modal open={open} title="New invoice" onClose={() => setOpen(false)} footer={<Button onClick={() => {
         const price = prices.find((p) => p.service === f.service)
         api.add({ id: `INV-${10236 + rows.length}`, patient: f.patient, items: f.service, amount: f.payer.startsWith('NHIA') ? price.nhia : price.price, payer: f.payer, status: 'UNPAID', at: new Date().toISOString() })
-        setOpen(false); toast('Invoice created & sent to patient')
+        setOpen(false); toast('Invoice created')
       }}>Create</Button>}>
         <div className="form">
           <Field label="Patient" as="select" options={patients.map((p) => p.name)} value={f.patient} onChange={(e) => setF({ ...f, patient: e.target.value })} />
@@ -424,7 +427,7 @@ export function PriceList() {
       <PageHeader title="Price List" subtitle="Self-pay and NHIA tariff per service." actions={<Button icon="Plus" onClick={() => api.add({ service: 'New service', code: 'NEW', price: 0, nhia: 0 })}>Add service</Button>} />
       <Tabs tabs={['Services']} value={tab} onChange={setTab} />
       <Card pad={false}>
-        <Table rows={rows} columns={[{ label: 'Code', key: 'code' }, { label: 'Service', key: 'service' }, { label: 'Self-pay', render: (r) => naira(r.price) }, { label: 'NHIA tariff', render: (r) => naira(r.nhia) }]} />
+        <Table rows={rows} columns={[{ label: 'Code', key: 'code' }, { label: 'Service', key: 'service' }, { label: 'Self-pay', render: (r) => naira(r.price) }, { label: 'NHIA tariff', render: (r) => naira(r.nhia) }, { label: '', render: (r) => <DeleteButton what={r.service} onConfirm={() => api.remove(r.id)} /> }]} />
       </Card>
       <Timeline items={[]} />
     </>

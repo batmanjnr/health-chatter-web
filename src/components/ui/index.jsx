@@ -281,6 +281,13 @@ export function Alert({ tone = 'info', title, children, icon }) {
   )
 }
 
+/* A "Delete" button that asks first, then deletes from the database. */
+export function DeleteButton({ onConfirm, label = 'Delete', what = 'this item' }) {
+  return (
+    <Button size="sm" variant="ghost" onClick={(e) => { e.stopPropagation(); if (window.confirm(`Delete ${what}? This can't be undone.`)) onConfirm() }}>{label}</Button>
+  )
+}
+
 export function EmptyState({ text, icon = 'Inbox' }) {
   return (
     <div className="empty">
@@ -304,7 +311,9 @@ export function BarChart({ data, height = 160, tone = 'teal' }) {
   )
 }
 
-export function Sparkline({ points, height = 60, color = 'var(--c-brand)' }) {
+export function Sparkline({ points: raw, height = 60, color = 'var(--c-brand)' }) {
+  // Live data can have 0 or 1 readings — draw a flat line instead of nothing.
+  const points = raw.length >= 2 ? raw : raw.length === 1 ? [raw[0], raw[0]] : [0, 0]
   const max = Math.max(...points)
   const min = Math.min(...points)
   const step = 100 / (points.length - 1)

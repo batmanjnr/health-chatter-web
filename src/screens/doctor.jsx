@@ -1,4 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { api as request } from '../lib/api.js'
+import { docId, docName, openFile, uploadFile } from '../lib/files.js'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext.jsx'
 import { ROLES, can } from '../config/roles.js'
@@ -11,7 +13,7 @@ import {
 const BASE = '/doctor'
 const Back = ({ to, label }) => <Link to={to} className="back"><Icon name="ChevronLeft" size={16} /> {label}</Link>
 const logAccess = (user, action, resource) =>
-  db.add('auditLog', { at: new Date().toISOString(), actor: user.name, role: user.role, action, resource, ip: '102.89.14.22', facility: user.facility ?? '—' })
+  db.add('auditLog', { at: new Date().toISOString(), actor: user.name, role: user.role, action, resource, facility: user.facility ?? '—' })
 
 /* ================= Dashboard ================= */
 export function DoctorDashboard() {
@@ -20,7 +22,7 @@ export function DoctorDashboard() {
   const [appts] = useCollection('appointments')
   const [inbasket] = useCollection('inBasket')
   const [labs] = useCollection('labOrders')
-  const mine = appts.filter((a) => a.doctor === user.name)
+  const mine = appts.filter((a) => a._doctorId === user.id)
   const today = mine.filter((a) => isToday(a.at)).sort((a, b) => a.at.localeCompare(b.at))
   return (
     <>
@@ -28,7 +30,7 @@ export function DoctorDashboard() {
       <StatGrid items={[
         { label: "Today's patients", value: today.length, icon: 'Users', tone: 'teal' },
         { label: 'In-basket', value: inbasket.length, hint: `${inbasket.filter((i) => i.urgency === 'urgent').length} urgent`, icon: 'Inbox', tone: 'pink' },
-        { label: 'Results to review', value: labs.filter((l) => l.orderedBy === user.name && l.status === 'COMPLETED').length, icon: 'FlaskConical', tone: 'blue' },
+        { label: 'Results to review', value: labs.filter((l) => l._doctorId === user.id && l.status === 'COMPLETED').length, icon: 'FlaskConical', tone: 'blue' },
         { label: 'Pending confirmations', value: mine.filter((a) => a.status === 'PENDING').length, icon: 'CalendarClock', tone: 'yellow' },
       ]} />
       <Grid>
@@ -86,9 +88,37 @@ export function Schedule() {
   const { user } = useAuth()
   const toast = useToast()
   const [appts, api] = useCollection('appointments')
-  const [avail, setAvail] = useState({ Monday: ['09:00–12:00', '14:00–17:00'], Tuesday: ['09:00–12:00'], Wednesday: ['09:00–12:00', '14:00–17:00'], Thursday: ['14:00–17:00'], Friday: ['09:00–13:00'], Saturday: [], Sunday: [] })
+  // Weekly availability lives in the shared Availability table, so patients
+  // see the same open slots on the website and in the mobile app.
+  const emptyWeek = () => Object.fromEntries(DAYS.map((d) => [d, []]))
+  const [avail, setAvail] = useState(emptyWeek)
+  const [savingAvail, setSavingAvail] = useState(false)
+  const loadAvail = () =>
+    request('/doctors/me/availability').then((slots) => {
+      const week = emptyWeek()
+      slots.forEach((s) => (week[s.day] ??= []).push(s.timeRange))
+      setAvail(week)
+    }, () => {})
+  useEffect(() => {
+    if (user.role === 'DOCTOR') loadAvail()
+  }, [])
+  const saveAvail = async () => {
+    setSavingAvail(true)
+    try {
+      for (const d of DAYS) {
+        await request(`/doctors/me/availability/day/${encodeURIComponent(d)}`, { method: 'DELETE' })
+        for (const timeRange of avail[d]) await request('/doctors/me/availability', { method: 'POST', body: { day: d, timeRange } })
+      }
+      await loadAvail()
+      toast('Availability saved')
+    } catch (err) {
+      toast(err.message, 'error')
+    } finally {
+      setSavingAvail(false)
+    }
+  }
   const [tab, setTab] = useState('Appointments')
-  const mine = appts.filter((a) => a.doctor === user.name).sort((a, b) => a.at.localeCompare(b.at))
+  const mine = appts.filter((a) => a._doctorId === user.id).sort((a, b) => a.at.localeCompare(b.at))
   return (
     <>
       <PageHeader title="Schedule" />
@@ -103,14 +133,14 @@ export function Schedule() {
             { label: 'Status', render: (r) => <Badge>{r.status}</Badge> },
             { label: '', render: (r) => r.status === 'PENDING' && (
               <div className="row-actions">
-                <Button size="sm" onClick={() => { api.update(r.id, { status: 'CONFIRMED' }); toast('Confirmed — patient notified by SMS') }}>Confirm</Button>
+                <Button size="sm" onClick={() => { api.update(r.id, { status: 'CONFIRMED' }); toast('Confirmed — patient notified') }}>Confirm</Button>
                 <Button size="sm" variant="ghost" onClick={() => api.update(r.id, { status: 'CANCELLED' })}>Decline</Button>
               </div>
             ) },
           ]} />
         </Card>
       ) : (
-        <Card title="Weekly availability" action={<Button size="sm" onClick={() => toast('Availability saved')}>Save</Button>}>
+        <Card title="Weekly availability" action={<Button size="sm" disabled={savingAvail} onClick={saveAvail}>Save</Button>}>
           <div className="avail">
             {DAYS.map((d) => (
               <div key={d} className="avail__row">
@@ -120,7 +150,7 @@ export function Schedule() {
                     <span key={s} className="chip">{s} <button aria-label={`Remove ${s}`} onClick={() => setAvail({ ...avail, [d]: avail[d].filter((x) => x !== s) })}><Icon name="X" size={12} /></button></span>
                   )) : <small className="muted">Unavailable</small>}
                 </div>
-                <Button size="sm" variant="ghost" icon="Plus" onClick={() => setAvail({ ...avail, [d]: [...avail[d], '09:00–12:00'] })}>Add</Button>
+                <Button size="sm" variant="ghost" icon="Plus" onClick={() => { const range = window.prompt(`Add a time slot for ${d}`, '09:00–12:00'); if (range?.trim()) setAvail({ ...avail, [d]: [...avail[d], range.trim()] }) }}>Add</Button>
               </div>
             ))}
           </div>
@@ -162,6 +192,7 @@ export function PatientChart({ base = BASE }) {
   const [labs] = useCollection('labOrders')
   const [rx] = useCollection('prescriptions')
   const [notes, notesApi] = useCollection('clinicalNotes')
+  const [vitals] = useCollection('vitals')
   const [tab, setTab] = useState('Summary')
   const [glass, setGlass] = useState(false)
   const [reason, setReason] = useState('')
@@ -216,7 +247,12 @@ export function PatientChart({ base = BASE }) {
             {canNotes ? <Timeline items={(p.encounters ?? []).map((e) => ({ title: `${e.date} · ${e.type}`, subtitle: e.note, done: true }))} /> : <Alert tone="warning">Clinical notes are restricted for your role.</Alert>}
           </Card>
           <Card title="Latest vitals">
-            <KeyValue items={[['BP', '138/88 mmHg'], ['Pulse', '84 bpm'], ['Temp', '36.9 °C'], ['SpO₂', '97%'], ['Recorded', 'Today 09:12 by Nurse Halima Yusuf']]} />
+            {(() => {
+              const v = vitals.filter((x) => x.patientId === p.id || x.patient === p.name).sort((a, b) => String(b.at).localeCompare(String(a.at)))[0]
+              return v
+                ? <KeyValue items={[['BP', v.bp ? `${v.bp} mmHg` : '—'], ['Pulse', v.pulse ? `${v.pulse} bpm` : '—'], ['Temp', v.temp ? `${v.temp} °C` : '—'], ['SpO₂', v.spo2 ? `${v.spo2}%` : '—'], ['Recorded', `${fmtDate(v.at, true)} by ${v.by ?? '—'}`]]} />
+                : <p className="muted">No vitals recorded yet.</p>
+            })()}
           </Card>
         </Grid>
       )}
@@ -282,6 +318,8 @@ export function NewNote() {
 }
 
 export function NewOrder() {
+  const [facilityRows] = useCollection('facilities')
+  const labFacilities = facilityRows.filter((x) => x.status === 'VERIFIED' && ['Laboratory', 'Imaging centre'].includes(x.type)).map((x) => x.name)
   const { id } = useParams()
   const { user } = useAuth()
   const navigate = useNavigate()
@@ -306,7 +344,7 @@ export function NewOrder() {
           <Field label="Order type" as="select" options={['Lab', 'Imaging']} value={f.kind} onChange={(e) => setF({ ...f, kind: e.target.value, test: e.target.value === 'Lab' ? 'Full Blood Count' : 'Chest X-Ray (PA)' })} />
           <Field label="Test" as="select" options={tests} value={f.test} onChange={(e) => setF({ ...f, test: e.target.value })} />
           <Field label="Priority" as="select" options={['ROUTINE', 'URGENT', 'STAT']} value={f.priority} onChange={(e) => setF({ ...f, priority: e.target.value })} />
-          <Field label="Perform at" as="select" options={['Synlab Diagnostics, Ikeja', 'LUTH Laboratory', 'Kano Specialist Diagnostics']} value={f.lab} onChange={(e) => setF({ ...f, lab: e.target.value })} />
+          <Field label="Perform at" as="select" options={labFacilities.length ? labFacilities : [f.lab].filter(Boolean)} value={f.lab} onChange={(e) => setF({ ...f, lab: e.target.value })} />
           <Field label="Clinical notes for lab" as="textarea" className="span-2" value={f.notes} onChange={(e) => setF({ ...f, notes: e.target.value })} />
           <div className="form__actions"><Button type="submit">Place order</Button></div>
         </form>
@@ -365,7 +403,7 @@ export function TelemedicineQueue() {
   const { user } = useAuth()
   const navigate = useNavigate()
   const [appts] = useCollection('appointments')
-  const rows = appts.filter((a) => a.doctor === user.name && a.type === 'TELEMEDICINE' && a.status === 'CONFIRMED')
+  const rows = appts.filter((a) => a._doctorId === user.id && a.type === 'TELEMEDICINE' && a.status === 'CONFIRMED')
   return (
     <>
       <PageHeader title="Telemedicine" subtitle="Patients in your virtual waiting room." />
@@ -390,6 +428,7 @@ export function DoctorConsult() {
   const a = appts.find((x) => x.id === id)
   const [note, setNote] = useState('')
   const [escalate, setEscalate] = useState(false)
+  const [escReason, setEscReason] = useState('')
   if (!a) return <EmptyState text="Not found." />
   return (
     <div className="call">
@@ -399,7 +438,7 @@ export function DoctorConsult() {
         <div className="call__controls">
           <button className="icon-btn" aria-label="Microphone"><Icon name="Mic" /></button>
           <button className="icon-btn" aria-label="Camera"><Icon name="Video" /></button>
-          <button className="icon-btn is-end" aria-label="End call" onClick={() => { api.update(a.id, { status: 'COMPLETED' }); db.add('clinicalNotes', { patientId: a.patientId, author: a.doctor, at: new Date().toISOString(), subjective: note, assessment: 'Telemedicine consult' }); toast('Visit completed — summary sent to patient'); navigate(`${BASE}/telemedicine`) }}><Icon name="PhoneOff" /></button>
+          <button className="icon-btn is-end" aria-label="End call" onClick={() => { api.update(a.id, { status: 'COMPLETED' }); db.add('clinicalNotes', { patientId: a.patientId, author: a.doctor, at: new Date().toISOString(), subjective: note, assessment: 'Telemedicine consult' }); toast('Visit completed — note saved'); navigate(`${BASE}/telemedicine`) }}><Icon name="PhoneOff" /></button>
         </div>
       </div>
       <aside className="call__side">
@@ -411,9 +450,9 @@ export function DoctorConsult() {
           <Button size="sm" variant="ghost" icon="FlaskConical" onClick={() => navigate(`${BASE}/patients/${a.patientId}/order`)}>Order</Button>
         </div>
         <Button variant="danger" icon="Siren" onClick={() => setEscalate(true)}>Needs in-person / emergency care</Button>
-        <Modal open={escalate} title="Escalate to physical care" onClose={() => setEscalate(false)} footer={<Button variant="danger" onClick={() => { setEscalate(false); toast('Patient shown nearest ED + ambulance number; referral logged', 'error') }}>Send escalation</Button>}>
+        <Modal open={escalate} title="Escalate to physical care" onClose={() => setEscalate(false)} footer={<Button variant="danger" onClick={() => { api.update(a.id, { status: 'ESCALATED', escalation: { reason: escReason, at: new Date().toISOString(), by: user.name } }); logAccess(user, 'ESCALATE', `Telemedicine ${a.id} — ${a.patient}: ${escReason || 'no reason given'}`); setEscalate(false); toast('Escalation saved — patient told to go to the nearest emergency department', 'error') }}>Send escalation</Button>}>
           <p>The patient will see: <b>“This patient requires immediate physical/emergency care.”</b> with directions to the nearest emergency department and the 112 line.</p>
-          <Field label="Reason" as="textarea" />
+          <Field label="Reason" as="textarea" value={escReason} onChange={(e) => setEscReason(e.target.value)} />
         </Modal>
       </aside>
     </div>
@@ -428,7 +467,7 @@ export function DoctorPrescriptions() {
     <>
       <PageHeader title="e-Prescriptions" subtitle="Everything you've prescribed and its dispensing status." />
       <Card pad={false}>
-        <Table rows={rx.filter((r) => r.doctor === user.name)} columns={[
+        <Table rows={rx.filter((r) => r._doctorId === user.id)} columns={[
           { label: 'Patient', key: 'patient' }, { label: 'Medication', render: (r) => `${r.drug} ${r.dosage}` }, { label: 'Frequency', key: 'frequency' },
           { label: 'Pharmacy', key: 'pharmacy' }, { label: 'Issued', render: (r) => fmtDate(r.at, true) }, { label: 'Status', render: (r) => <Badge>{r.status}</Badge> },
         ]} />
@@ -448,7 +487,7 @@ export function DoctorOrders() {
       <Tabs tabs={['Lab', 'Imaging']} value={tab} onChange={setTab} />
       <Card pad={false}>
         {tab === 'Lab' ? (
-          <Table rows={labs.filter((l) => l.orderedBy === user.name)} columns={[
+          <Table rows={labs.filter((l) => l._doctorId === user.id)} columns={[
             { label: 'Patient', key: 'patient' }, { label: 'Test', key: 'test' }, { label: 'Priority', render: (r) => <Badge>{r.priority}</Badge> },
             { label: 'Status', render: (r) => <Badge>{r.status}</Badge> }, { label: 'Result', render: (r) => r.result?.summary ?? '—' },
           ]} />
@@ -467,9 +506,9 @@ export function Referrals({ base = BASE }) {
   const [patients] = useCollection('patients')
   const preselect = new URLSearchParams(window.location.search).get('patient')
   const [open, setOpen] = useState(Boolean(preselect))
-  const [f, setF] = useState({ patient: patients.find((p) => p.id === preselect)?.name ?? patients[0]?.name, toSpecialty: 'Cardiology', toFacility: 'LUTH', reason: '' })
+  const [f, setF] = useState({ patient: patients.find((p) => p.id === preselect)?.name ?? patients[0]?.name, toSpecialty: 'Cardiology', toFacility: '', reason: '' })
   const [tab, setTab] = useState('Outgoing')
-  const list = rows.filter((r) => (tab === 'Outgoing' ? r.from.startsWith(user.name) : !r.from.startsWith(user.name)))
+  const list = rows.filter((r) => (tab === 'Outgoing' ? r._owner === user.id : r._owner !== user.id))
   return (
     <>
       <PageHeader title="Referrals" subtitle="Structured referrals with a summary attached — tracked to outcome." actions={<Button icon="Plus" onClick={() => setOpen(true)}>New referral</Button>} />
@@ -497,6 +536,8 @@ export function Referrals({ base = BASE }) {
 /* ================= Earnings & credentials ================= */
 export function Earnings() {
   const [rows] = useCollection('earnings')
+  const [payout] = useCollection('payoutAccounts')
+  const acct = payout[0]
   const gross = rows.reduce((s, r) => s + r.gross, 0)
   const fee = rows.reduce((s, r) => s + r.fee, 0)
   return (
@@ -512,7 +553,7 @@ export function Earnings() {
         <Table rows={rows} columns={[{ label: 'Date', render: (r) => fmtDate(r.date) }, { label: 'Patient', key: 'patient' }, { label: 'Service', key: 'service' }, { label: 'Gross', render: (r) => naira(r.gross) }, { label: 'Fee', render: (r) => naira(r.fee) }, { label: 'Net', render: (r) => naira(r.gross - r.fee) }]} />
       </Card>
       <Card title="Payout account">
-        <KeyValue items={[['Bank', 'GTBank'], ['Account', '•••• 4421'], ['Settlement partner', 'Paystack']]} />
+        {acct ? <KeyValue items={[['Bank', acct.bank], ['Account', `•••• ${acct.accountLast4}`], ['Settlement partner', acct.partner]]} /> : <p className="muted">No payout account set up yet.</p>}
       </Card>
     </>
   )
@@ -520,22 +561,26 @@ export function Earnings() {
 
 export function Credentials() {
   const { user } = useAuth()
+  const toast = useToast()
+  const [verifications, vApi] = useCollection('verifications')
+  const v = verifications.find((x) => x.userId === user.id)
+  const status = v?.status === 'APPROVED' ? 'VERIFIED' : v?.status ?? 'NOT_SUBMITTED'
   return (
     <>
       <PageHeader title="Credentials & Verification" />
-      <Alert tone="success" title="Verified practitioner">Your {ROLES[user.role].regulator} licence was checked against the official register.</Alert>
+      {status === 'VERIFIED'
+        ? <Alert tone="success" title="Verified practitioner">Your {ROLES[user.role].regulator} licence was checked against the official register.</Alert>
+        : <Alert tone="warning" title="Not yet verified">Your {ROLES[user.role].regulator} licence hasn't been approved yet.</Alert>}
       <Grid>
         <Card title="Licence">
-          <KeyValue items={[['Regulator', ROLES[user.role].regulator], ['Number', user.license], ['Specialty', user.specialty], ['Valid until', '31 Dec 2026'], ['Status', <Badge key="s">VERIFIED</Badge>]]} />
-          <Button variant="ghost" icon="Upload">Upload renewed licence</Button>
+          <KeyValue items={[['Regulator', ROLES[user.role].regulator], ['Number', user.license], ['Specialty', user.specialty], ['Valid until', v?.validUntil ? fmtDate(v.validUntil) : '—'], ['Status', <Badge key="s">{status}</Badge>]]} />
+          <label className="b b--ghost">
+            <Icon name="Upload" size={16} /> Upload renewed licence
+            <input type="file" accept=".pdf,image/*" hidden onChange={(e) => { const file = e.target.files?.[0]; e.target.value = ''; if (!file || !v) return toast(v ? 'No file chosen' : 'No licence review on file — contact your moderator', 'error'); uploadFile(file).then((f) => { vApi.update(v.id, { docs: [...(v.docs ?? []), { id: f.id, name: f.name, uploadedAt: new Date().toISOString() }] }); toast('Uploaded — your moderator will review it') }, (err) => toast(err.message, 'error')) }} />
+          </label>
         </Card>
         <Card title="Documents on file">
-          <List items={[
-            { id: 1, icon: 'FileCheck', title: 'Annual practising licence 2026', right: <Badge>VERIFIED</Badge> },
-            { id: 2, icon: 'FileCheck', title: 'MBBS certificate', right: <Badge>VERIFIED</Badge> },
-            { id: 3, icon: 'FileCheck', title: 'Professional indemnity cover', right: <Badge>PENDING</Badge> },
-            { id: 4, icon: 'FileCheck', title: 'Signed Provider Agreement', right: <Badge>SIGNED</Badge> },
-          ]} />
+          <List items={(v?.docs ?? []).map((d) => ({ id: docId(d) ?? docName(d), icon: 'FileCheck', title: docName(d), onClick: docId(d) ? () => openFile(docId(d)).catch((err) => toast(err.message, 'error')) : undefined, right: <Badge>{status === 'VERIFIED' ? 'VERIFIED' : 'PENDING'}</Badge> }))} empty="No documents on file." />
         </Card>
       </Grid>
     </>

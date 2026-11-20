@@ -1,21 +1,46 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext.jsx'
-import * as app from '../data/appData.js'
+import { api as request } from '../lib/api.js'
+import { downloadCsv } from '../lib/exportCsv.js'
 import { fmtDate, fmtTime, naira, useCollection } from '../lib/store.js'
 import {
   Alert, Avatar, Badge, Button, Card, EmptyState, Field, Grid, Icon, KeyValue, List, Modal, PageHeader,
-  Progress, SearchInput, Sparkline, StatGrid, Table, Tabs, Timeline, Toggle, filterRows, useToast,
+  Progress, SearchInput, Sparkline, StatGrid, Table, Tabs, Timeline, Toggle, filterRows, useToast, DeleteButton,
 } from '../components/ui/index.jsx'
 
 const BASE = '/patient'
 const BackLink = ({ to, label }) => (
   <Link to={to} className="back"><Icon name="ChevronLeft" size={16} /> {label}</Link>
 )
+/* The patient's health summary — the same record the mobile app edits. */
+const useHealthProfile = () => {
+  const [hp, setHp] = useState(null)
+  useEffect(() => {
+    request('/patients/me/health-profile').then(setHp, () => setHp(null))
+  }, [])
+  return hp ?? {}
+}
+const activeMeds = (meds) => meds.filter((m) => m.state === 'ACTIVE')
+
+/* Real network / camera / microphone check for the video waiting room. */
+const useDeviceCheck = () => {
+  const [state, setState] = useState({ online: navigator.onLine, network: 'Checking…', camera: false, mic: false })
+  useEffect(() => {
+    const c = navigator.connection
+    const network = !navigator.onLine ? 'Offline' : c?.downlink ? `${c.downlink >= 1.5 ? 'Good' : 'Weak'} — about ${c.downlink} Mbps` : 'Connected'
+    navigator.mediaDevices?.enumerateDevices?.()
+      .then((ds) => setState({ online: navigator.onLine, network, camera: ds.some((d) => d.kind === 'videoinput'), mic: ds.some((d) => d.kind === 'audioinput') }))
+      .catch(() => setState((s) => ({ ...s, network })))
+  }, [])
+  return state
+}
+
 const useMyAppointments = () => {
   const { user } = useAuth()
   const [rows, api] = useCollection('appointments')
-  return [rows.filter((a) => a.patient === user.name), api, rows]
+  // The server only returns this patient's own appointments.
+  return [rows, api, rows]
 }
 
 /* ================= Dashboard ================= */
@@ -23,8 +48,14 @@ export function PatientDashboard() {
   const { user } = useAuth()
   const navigate = useNavigate()
   const [appts] = useMyAppointments()
+  const [bills] = useCollection('billItems')
+  const [labResults] = useCollection('labResults')
+  const [meds] = useCollection('medications')
+  const [vitals] = useCollection('vitals')
+  const bp = vitals.filter((v) => v.bp).sort((a, b) => String(a.at).localeCompare(String(b.at))).slice(-7)
+  const sys = bp.map((v) => Number(v.bp.split('/')[0]))
   const upcoming = appts.filter((a) => new Date(a.at) >= new Date(new Date().setHours(0, 0, 0, 0)) && a.status !== 'CANCELLED').sort((a, b) => a.at.localeCompare(b.at))
-  const outstanding = app.billing.lineItems.filter((b) => b.coverageType === 'patient').reduce((s, b) => s + b.amount, 0)
+  const outstanding = bills.filter((b) => b.coverageType === 'patient' && !b.paid).reduce((s, b) => s + b.amount, 0)
 
   return (
     <>
@@ -35,8 +66,8 @@ export function PatientDashboard() {
       />
       <StatGrid items={[
         { label: 'Upcoming visits', value: upcoming.length, icon: 'CalendarDays', tone: 'teal' },
-        { label: 'New results', value: app.labResults.filter((l) => l.status !== 'PENDING').length, icon: 'FlaskConical', tone: 'blue' },
-        { label: 'Active medications', value: app.medications.active.length, icon: 'Pill', tone: 'pink' },
+        { label: 'New results', value: labResults.filter((l) => l.status !== 'PENDING').length, icon: 'FlaskConical', tone: 'blue' },
+        { label: 'Active medications', value: activeMeds(meds).length, icon: 'Pill', tone: 'pink' },
         { label: 'Outstanding bills', value: naira(outstanding), icon: 'Wallet', tone: 'yellow' },
       ]} />
       <Grid>
@@ -56,14 +87,21 @@ export function PatientDashboard() {
           ) : <EmptyState text="No upcoming appointments." />}
         </Card>
         <Card title="Blood pressure (last 7 readings)">
-          <Sparkline points={[148, 145, 142, 139, 141, 136, 132]} height={80} />
-          <p className="muted">Trending down — 132/86 mmHg today. Keep it up!</p>
+          {bp.length ? (
+            <>
+              <Sparkline points={sys} height={80} />
+              <p className="muted">
+                {bp.length > 1 ? (sys[sys.length - 1] < sys[0] ? 'Trending down' : sys[sys.length - 1] > sys[0] ? 'Trending up' : 'Steady') + ' — ' : ''}
+                {bp[bp.length - 1].bp} mmHg on {fmtDate(bp[bp.length - 1].at)}.
+              </p>
+            </>
+          ) : <EmptyState text="No blood pressure readings yet." />}
         </Card>
         <Card title="Recent results" action={<Link to={`${BASE}/labs`}>All results</Link>}>
-          <List items={app.labResults.slice(0, 3).map((l) => ({ id: l.id, icon: 'FlaskConical', title: l.testName, subtitle: l.summary, right: <Badge>{l.status}</Badge>, onClick: () => navigate(`${BASE}/labs/${l.id}`) }))} />
+          <List items={labResults.slice(0, 3).map((l) => ({ id: l.id, icon: 'FlaskConical', title: l.testName, subtitle: l.summary, right: <Badge>{l.status}</Badge>, onClick: () => navigate(`${BASE}/labs/${l.id}`) }))} />
         </Card>
         <Card title="Medications" action={<Link to={`${BASE}/medications`}>Manage</Link>}>
-          <List items={app.medications.active.map((m) => ({ id: m.id, icon: 'Pill', tone: 'pink', title: `${m.name} ${m.dosage}`, subtitle: m.frequency, right: <small className={m.daysLeft < 7 ? 'text-warn' : ''}>{m.daysLeft} days left</small> }))} />
+          <List items={activeMeds(meds).map((m) => ({ id: m.id, icon: 'Pill', tone: 'pink', title: `${m.name} ${m.dosage}`, subtitle: m.frequency, right: <small className={m.daysLeft < 7 ? 'text-warn' : ''}>{m.daysLeft} days left</small> }))} />
         </Card>
       </Grid>
       <div className="quick">
@@ -84,7 +122,9 @@ export function FindDoctor() {
   const [q, setQ] = useState('')
   const [spec, setSpec] = useState('All')
   const [mode, setMode] = useState('Any')
-  const list = filterRows(app.doctors, q, ['name', 'specialty', 'hospital'])
+  const [doctors] = useCollection('doctors')
+  const [specialties] = useCollection('specialties')
+  const list = filterRows(doctors, q, ['name', 'specialty', 'hospital'])
     .filter((d) => spec === 'All' || d.specialty === spec)
     .filter((d) => mode === 'Any' || d.visitType.includes(mode))
   return (
@@ -92,7 +132,7 @@ export function FindDoctor() {
       <PageHeader title="Find a Doctor" subtitle="All doctors are MDCN-verified by Healthchatter." />
       <div className="toolbar">
         <SearchInput value={q} onChange={setQ} placeholder="Search name, specialty or hospital" />
-        <Field label="Specialty" as="select" options={['All', ...app.specialties]} value={spec} onChange={(e) => setSpec(e.target.value)} />
+        <Field label="Specialty" as="select" options={['All', ...specialties]} value={spec} onChange={(e) => setSpec(e.target.value)} />
         <Field label="Visit type" as="select" options={['Any', 'Telemedicine', 'In-Person']} value={mode} onChange={(e) => setMode(e.target.value)} />
       </div>
       <div className="cards">
@@ -104,13 +144,13 @@ export function FindDoctor() {
               <small>{d.specialty} · {d.hospital}</small>
               <span className="doc__meta">
                 <span><Icon name="Star" size={14} /> {d.rating} ({d.reviewCount})</span>
-                <span>{d.experienceYears} yrs</span>
+                {d.experienceYears && <span>{d.experienceYears} yrs</span>}
                 <span>{d.visitType}</span>
               </span>
             </div>
             <div className="doc__fee">
               <b>{naira(d.fee)}</b>
-              <Button size="sm">Book</Button>
+              <Button size="sm" onClick={(e) => { e.stopPropagation(); navigate(`${BASE}/doctors/${d.id}/book`) }}>Book</Button>
             </div>
           </article>
         ))}
@@ -123,7 +163,8 @@ export function FindDoctor() {
 export function DoctorProfile() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const d = app.doctors.find((x) => x.id === id)
+  const [doctors] = useCollection('doctors')
+  const d = doctors.find((x) => x.id === id)
   if (!d) return <EmptyState text="Doctor not found." />
   return (
     <>
@@ -132,10 +173,10 @@ export function DoctorProfile() {
       <Grid>
         <Card title="About">
           <p>{d.about}</p>
-          <KeyValue items={[['Experience', `${d.experienceYears} years`], ['Patients seen', d.patientsSeen], ['Languages', d.languages], ['Consultation fee', naira(d.fee)], ['Visit type', d.visitType], ['Verification', 'MDCN licence verified']]} />
+          <KeyValue items={[['Experience', d.experienceYears ? `${d.experienceYears} years` : '—'], ['Patients seen', d.patientsSeen], ['Languages', d.languages], ['Consultation fee', naira(d.fee)], ['Visit type', d.visitType], ['Verification', 'MDCN licence verified']]} />
         </Card>
         <Card title="Next available">
-          <List items={d.slots.map((s) => ({ id: s, icon: 'Clock', title: s, right: <Button size="sm" variant="ghost" onClick={() => navigate(`${BASE}/doctors/${d.id}/book`)}>Select</Button> }))} />
+          <List empty="No open slots yet." items={(d.slots ?? []).map((s) => ({ id: s, icon: 'Clock', title: s, right: <Button size="sm" variant="ghost" onClick={() => navigate(`${BASE}/doctors/${d.id}/book`)}>Select</Button> }))} />
           <h3 className="sub">Patient reviews</h3>
           <p className="muted"><Icon name="Star" size={14} /> {d.rating} average from {d.reviewCount} verified visits.</p>
         </Card>
@@ -150,15 +191,18 @@ export function BookAppointment() {
   const navigate = useNavigate()
   const toast = useToast()
   const [, api] = useCollection('appointments')
-  const d = app.doctors.find((x) => x.id === id) ?? app.doctors[0]
+  const [doctors] = useCollection('doctors')
+  const [policies] = useCollection('insurancePolicies')
+  const [family] = useCollection('dependants')
+  const d = doctors.find((x) => x.id === id) ?? doctors[0]
   const [step, setStep] = useState(0)
   const [form, setForm] = useState({ date: '', time: '10:00', type: 'TELEMEDICINE', reason: '', pay: 'HMO', reminder: true, consent: false })
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }))
 
   const confirm = () => {
     const at = new Date(`${form.date}T${form.time}`).toISOString()
-    const appt = api.add({ patientId: 'pt-1', patient: user.name, doctor: d.name, specialty: d.specialty, facility: d.hospital, at, type: form.type, status: 'PENDING', reason: form.reason })
-    toast('Appointment requested — you’ll get an SMS when confirmed')
+    const appt = api.add({ ...(form.forWhom && form.forWhom !== 'Myself' && { forPerson: form.forWhom }), patientId: user.id, patient: user.name, doctorId: d.id, doctor: d.name, specialty: d.specialty, facility: d.hospital, at, type: form.type, status: 'PENDING', reason: form.reason })
+    toast('Appointment requested — you’ll be notified when it’s confirmed')
     navigate(`${BASE}/appointments/${appt.id}`)
   }
 
@@ -178,7 +222,7 @@ export function BookAppointment() {
         {step === 1 && (
           <div className="form">
             <Field label="Reason for visit" as="textarea" value={form.reason} onChange={set('reason')} placeholder="e.g. headaches for 2 weeks" />
-            <Field label="Who is this for?" as="select" options={['Myself', 'Oluwaseun Ogunleye (son)', 'Mrs. Ifeoma Okafor (mother)']} />
+            <Field label="Who is this for?" as="select" options={['Myself', ...family.map((x) => `${x.name} (${String(x.relation).toLowerCase()})`)]} value={form.forWhom ?? 'Myself'} onChange={set('forWhom')} />
             {form.type === 'TELEMEDICINE' && (
               <label className="check"><input type="checkbox" checked={form.consent} onChange={(e) => setForm({ ...form, consent: e.target.checked })} /><span>I understand telemedicine has limits, may need an in-person exam, and is <b>not for emergencies</b>.</span></label>
             )}
@@ -187,7 +231,7 @@ export function BookAppointment() {
         )}
         {step === 2 && (
           <div className="form">
-            {[['HMO', `Bill my HMO (${app.insurance.provider})`], ['CARD', 'Card — Paystack'], ['TRANSFER', 'Bank transfer — Flutterwave'], ['USSD', 'USSD — Moniepoint']].map(([v, l]) => (
+            {[['HMO', `Bill my HMO (${policies[0]?.provider ?? 'none on file'})`], ['CARD', 'Card — Paystack'], ['TRANSFER', 'Bank transfer — Flutterwave'], ['USSD', 'USSD — Moniepoint']].map(([v, l]) => (
               <label key={v} className="radio"><input type="radio" name="pay" checked={form.pay === v} onChange={() => setForm({ ...form, pay: v })} /> {l}</label>
             ))}
             <Toggle label="SMS & calendar reminder" checked={form.reminder} onChange={(v) => setForm({ ...form, reminder: v })} />
@@ -277,6 +321,7 @@ export function WaitingRoom() {
   const [appts] = useMyAppointments()
   const a = appts.find((x) => x.id === id)
   const [answers, setAnswers] = useState({ symptoms: '', severity: 'Mild', meds: '' })
+  const device = useDeviceCheck()
   const [done, setDone] = useState(false)
   if (!a) return <EmptyState text="Appointment not found." />
   return (
@@ -286,15 +331,15 @@ export function WaitingRoom() {
       <Grid>
         <Card title="Connection check">
           <List items={[
-            { id: 'n', icon: 'Wifi', title: 'Network', subtitle: 'Good — 2.4 Mbps', right: <Badge>OK</Badge> },
-            { id: 'c', icon: 'Video', title: 'Camera', subtitle: 'Front camera detected', right: <Badge>OK</Badge> },
-            { id: 'm', icon: 'Mic', title: 'Microphone', subtitle: 'Working', right: <Badge>OK</Badge> },
+            { id: 'n', icon: 'Wifi', title: 'Network', subtitle: device.network, right: <Badge>{device.online ? 'OK' : 'OFFLINE'}</Badge> },
+            { id: 'c', icon: 'Video', title: 'Camera', subtitle: device.camera ? 'Camera detected' : 'No camera found', right: <Badge>{device.camera ? 'OK' : 'MISSING'}</Badge> },
+            { id: 'm', icon: 'Mic', title: 'Microphone', subtitle: device.mic ? 'Microphone detected' : 'No microphone found', right: <Badge>{device.mic ? 'OK' : 'MISSING'}</Badge> },
           ]} />
-          <Alert tone="info">Estimated wait: <b>about 4 minutes</b>. Weak network? We'll switch to audio-only automatically.</Alert>
+          <Alert tone="info">Your doctor will let you in shortly. Weak network? We'll switch to audio-only automatically.</Alert>
         </Card>
         <Card title="Pre-visit questionnaire">
           {done ? <Alert tone="success" title="Sent to your doctor">Thanks — Dr. will review before the call.</Alert> : (
-            <form className="form" onSubmit={(e) => { e.preventDefault(); setDone(true) }}>
+            <form className="form" onSubmit={(e) => { e.preventDefault(); api.update(a.id, { questionnaire: { ...answers, at: new Date().toISOString() } }); setDone(true) }}>
               <Field label="Main symptoms" as="textarea" required value={answers.symptoms} onChange={(e) => setAnswers({ ...answers, symptoms: e.target.value })} />
               <Field label="How severe?" as="select" options={['Mild', 'Moderate', 'Severe']} value={answers.severity} onChange={(e) => setAnswers({ ...answers, severity: e.target.value })} />
               <Field label="Medicines taken recently" value={answers.meds} onChange={(e) => setAnswers({ ...answers, meds: e.target.value })} />
@@ -340,10 +385,15 @@ export function ConsultationRoom() {
 export function HealthRecord() {
   const { user } = useAuth()
   const [tab, setTab] = useState('Summary')
-  const me = app.user
+  const hp = useHealthProfile()
+  const me = { bloodType: hp.bloodGroup ?? '—', genotype: hp.genotype ?? '—', hmoProvider: hp.coverageType ?? '—', allergies: hp.allergies ?? [] }
+  const [conditions] = useCollection('conditions')
+  const [meds] = useCollection('medications')
+  const [immunizations] = useCollection('immunizations')
+  const [visits] = useCollection('visits')
   return (
     <>
-      <PageHeader title="My Health Record" subtitle="Shared across facilities you've consented to." actions={<Button variant="ghost" icon="Download">Download (PDF)</Button>} />
+      <PageHeader title="My Health Record" subtitle="Shared across facilities you've consented to." actions={<Button variant="ghost" icon="Download" onClick={() => window.print()}>Download (PDF)</Button>} />
       <Tabs tabs={['Summary', 'Conditions', 'Allergies', 'Immunizations', 'Visit history']} value={tab} onChange={setTab} />
       {tab === 'Summary' && (
         <Grid>
@@ -352,18 +402,18 @@ export function HealthRecord() {
           </Card>
           <Card title="At a glance">
             <List items={[
-              { id: 'c', icon: 'Activity', title: `${app.conditions.filter((c) => c.status === 'Active').length} active conditions`, subtitle: app.conditions.filter((c) => c.status === 'Active').map((c) => c.name).join(', ') },
-              { id: 'a', icon: 'TriangleAlert', tone: 'red', title: 'Allergies', subtitle: me.allergies.join(', ') },
-              { id: 'm', icon: 'Pill', tone: 'pink', title: `${app.medications.active.length} active medications` },
-              { id: 'i', icon: 'Syringe', tone: 'blue', title: `${app.immunizations.length} immunizations on file` },
+              { id: 'c', icon: 'Activity', title: `${conditions.filter((c) => c.status === 'Active').length} active conditions`, subtitle: conditions.filter((c) => c.status === 'Active').map((c) => c.name).join(', ') },
+              { id: 'a', icon: 'TriangleAlert', tone: 'red', title: 'Allergies', subtitle: me.allergies.join(', ') || 'None recorded' },
+              { id: 'm', icon: 'Pill', tone: 'pink', title: `${activeMeds(meds).length} active medications` },
+              { id: 'i', icon: 'Syringe', tone: 'blue', title: `${immunizations.length} immunizations on file` },
             ]} />
           </Card>
         </Grid>
       )}
-      {tab === 'Conditions' && <Card pad={false}><Table rows={app.conditions} columns={[{ label: 'Condition', key: 'name' }, { label: 'Status', render: (r) => <Badge>{r.status.toUpperCase()}</Badge> }, { label: 'Diagnosed', key: 'diagnosedDate' }, { label: 'By', key: 'diagnosedBy' }]} /></Card>}
+      {tab === 'Conditions' && <Card pad={false}><Table rows={conditions} columns={[{ label: 'Condition', key: 'name' }, { label: 'Status', render: (r) => <Badge>{r.status.toUpperCase()}</Badge> }, { label: 'Diagnosed', key: 'diagnosedDate' }, { label: 'By', key: 'diagnosedBy' }]} /></Card>}
       {tab === 'Allergies' && <Card><List items={me.allergies.map((a) => ({ id: a, icon: 'TriangleAlert', tone: 'red', title: a, subtitle: 'Recorded by Dr. Ngozi Adeyemi' }))} /></Card>}
-      {tab === 'Immunizations' && <Card pad={false}><Table rows={app.immunizations} columns={[{ label: 'Vaccine', key: 'vaccine' }, { label: 'Dose', key: 'doseLabel' }, { label: 'Date', key: 'date' }, { label: 'Facility', key: 'facility' }]} /></Card>}
-      {tab === 'Visit history' && <Card><Timeline items={app.providerPatients[0].encounters.map((e) => ({ title: `${e.date} · ${e.type}`, subtitle: e.note, done: true }))} /></Card>}
+      {tab === 'Immunizations' && <Card pad={false}><Table rows={immunizations} columns={[{ label: 'Vaccine', key: 'vaccine' }, { label: 'Dose', key: 'doseLabel' }, { label: 'Date', key: 'date' }, { label: 'Facility', key: 'facility' }]} /></Card>}
+      {tab === 'Visit history' && <Card><Timeline items={visits.map((e) => ({ title: `${e.date} · ${e.type}`, subtitle: e.note, done: true }))} /></Card>}
     </>
   )
 }
@@ -371,11 +421,12 @@ export function HealthRecord() {
 /* ================= Labs & imaging ================= */
 export function LabResults() {
   const navigate = useNavigate()
+  const [labResults] = useCollection('labResults')
   return (
     <>
       <PageHeader title="Lab Results" subtitle="Results appear once verified and released by the lab." />
       <Card pad={false}>
-        <Table rows={app.labResults} onRowClick={(r) => navigate(`${BASE}/labs/${r.id}`)} columns={[
+        <Table rows={labResults} onRowClick={(r) => navigate(`${BASE}/labs/${r.id}`)} columns={[
           { label: 'Test', render: (r) => <b>{r.testName}</b> },
           { label: 'Summary', key: 'summary' },
           { label: 'Ordered by', key: 'orderingDoctor' },
@@ -389,11 +440,12 @@ export function LabResults() {
 
 export function LabDetail() {
   const { id } = useParams()
-  const l = app.labResults.find((x) => x.id === id)
+  const [labResults] = useCollection('labResults')
+  const l = labResults.find((x) => x.id === id)
   if (!l) return <EmptyState text="Result not found." />
   return (
     <>
-      <PageHeader back={<BackLink to={`${BASE}/labs`} label="Lab results" />} title={l.testName} subtitle={`${l.hospital} · ${l.timestamp}`} actions={<Button variant="ghost" icon="Download">Download</Button>} />
+      <PageHeader back={<BackLink to={`${BASE}/labs`} label="Lab results" />} title={l.testName} subtitle={`${l.hospital} · ${l.timestamp}`} actions={<Button variant="ghost" icon="Download" onClick={() => window.print()}>Download</Button>} />
       {l.status === 'FLAGGED' && <Alert tone="warning" title="Some values are outside the normal range">Your doctor has been notified and may message you.</Alert>}
       <Grid>
         <Card title="Result">
@@ -404,7 +456,7 @@ export function LabDetail() {
           <Timeline items={[
             { title: 'Sample collected', subtitle: l.timestamp, done: true },
             { title: 'Analysed', done: l.status !== 'PENDING' },
-            { title: 'Verified by licensed scientist', subtitle: 'Chioma Nnaji · MLSCN/77120', done: l.status !== 'PENDING' },
+            { title: 'Verified by licensed scientist', subtitle: l.verifiedBy ?? l.hospital, done: l.status !== 'PENDING' },
             { title: 'Released to you', done: l.status !== 'PENDING' },
           ]} />
         </Card>
@@ -414,11 +466,12 @@ export function LabDetail() {
 }
 
 export function Imaging() {
+  const [studies] = useCollection('patientImaging')
   return (
     <>
       <PageHeader title="Imaging" subtitle="Images load on tap to save data." />
       <div className="cards cards--3">
-        {app.imagingStudies.map((s) => (
+        {studies.map((s) => (
           <Card key={s.id} title={`${s.type} — ${s.bodyPart}`} action={<Badge>{s.status}</Badge>}>
             <div className="img-ph"><Icon name="ScanLine" size={36} /><small>Tap to load image (≈1.2 MB)</small></div>
             <p>{s.summary}</p>
@@ -434,12 +487,13 @@ export function Imaging() {
 export function Medications() {
   const toast = useToast()
   const [refills, api] = useCollection('refillRequests')
+  const [meds] = useCollection('medications')
   const { user } = useAuth()
   return (
     <>
       <PageHeader title="Medications" />
       <div className="cards cards--3">
-        {app.medications.active.map((m) => (
+        {activeMeds(meds).map((m) => (
           <Card key={m.id} title={m.name} action={<small>{m.daysLeft} days left</small>}>
             <p>{m.dosage} · {m.frequency}</p>
             <Progress value={m.refillProgress * 100} tone={m.daysLeft < 7 ? 'amber' : 'teal'} />
@@ -449,10 +503,10 @@ export function Medications() {
         ))}
       </div>
       <Card title="Refill requests" pad={false}>
-        <Table rows={refills.filter((r) => r.patient === user.name)} empty="No refill requests." columns={[{ label: 'Medication', key: 'drug' }, { label: 'Doctor', key: 'doctor' }, { label: 'Status', render: (r) => <Badge>{r.status}</Badge> }]} />
+        <Table rows={refills} empty="No refill requests." columns={[{ label: 'Medication', key: 'drug' }, { label: 'Doctor', key: 'doctor' }, { label: 'Status', render: (r) => <Badge>{r.status}</Badge> }]} />
       </Card>
       <Card title="Completed courses" pad={false}>
-        <Table rows={app.medications.completed} columns={[{ label: 'Medication', key: 'name' }, { label: 'Dosage', key: 'dosage' }, { label: 'Completed', key: 'completedDate' }]} />
+        <Table rows={meds.filter((m) => m.state === 'COMPLETED')} columns={[{ label: 'Medication', key: 'name' }, { label: 'Dosage', key: 'dosage' }, { label: 'Completed', key: 'completedDate' }]} />
       </Card>
     </>
   )
@@ -460,11 +514,12 @@ export function Medications() {
 
 /* ================= Referrals ================= */
 export function PatientReferrals() {
+  const [referrals] = useCollection('patientReferrals')
   return (
     <>
       <PageHeader title="Referrals" subtitle="Specialist referrals from your doctors." />
       <Card pad={false}>
-        <Table rows={app.referrals} columns={[
+        <Table rows={referrals} columns={[
           { label: 'To', render: (r) => <b>{r.toSpecialty}</b> },
           { label: 'From', key: 'fromDoctor' },
           { label: 'Reason', key: 'reason' },
@@ -479,11 +534,13 @@ export function PatientReferrals() {
 /* ================= Billing ================= */
 export function PatientBilling() {
   const toast = useToast()
-  const [paid, setPaid] = useState([])
+  const { user } = useAuth()
+  const [items, bills] = useCollection('billItems')
+  const [, payments] = useCollection('payments')
   const [pay, setPay] = useState(null)
   const [method, setMethod] = useState('Card (Paystack)')
-  const items = app.billing.lineItems
-  const due = items.filter((b) => b.coverageType === 'patient' && !paid.includes(b.id))
+  const paid = items.filter((b) => b.paid).map((b) => b.id)
+  const due = items.filter((b) => b.coverageType === 'patient' && !b.paid)
   return (
     <>
       <PageHeader title="Bills & Payments" subtitle="Secure payments via licensed providers. We never store card details." />
@@ -499,7 +556,7 @@ export function PatientBilling() {
           { label: '', render: (r) => r.coverageType === 'patient' && (paid.includes(r.id) ? <Badge>PAID</Badge> : <Button size="sm" onClick={() => setPay(r)}>Pay</Button>) },
         ]} />
       </Card>
-      <Modal open={!!pay} title={`Pay ${pay ? naira(pay.amount) : ''}`} onClose={() => setPay(null)} footer={<Button onClick={() => { setPaid([...paid, pay.id]); setPay(null); toast('Payment successful — receipt sent by email') }}>Pay now</Button>}>
+      <Modal open={!!pay} title={`Pay ${pay ? naira(pay.amount) : ''}`} onClose={() => setPay(null)} footer={<Button onClick={() => { bills.update(pay.id, { paid: true, paidAt: new Date().toISOString(), method }); payments.add({ id: `PAY-${Date.now().toString().slice(-6)}`, invoice: pay.id, patient: user.name, amount: pay.amount, method, at: new Date().toISOString(), status: 'SUCCESS', platformFee: Math.round(pay.amount * 0.1) }); setPay(null); toast('Payment recorded') }}>Pay now</Button>}>
         <p className="muted">{pay?.service} · {pay?.provider}</p>
         {['Card (Paystack)', 'Bank transfer (Flutterwave)', 'USSD (Moniepoint)', 'Interswitch / Verve'].map((m) => (
           <label key={m} className="radio"><input type="radio" checked={method === m} onChange={() => setMethod(m)} /> {m}</label>
@@ -513,7 +570,12 @@ export function PatientBilling() {
 /* ================= Insurance ================= */
 export function Insurance() {
   const [hmos] = useCollection('hmos')
-  const ins = app.insurance
+  const { user } = useAuth()
+  const toast = useToast()
+  const [policies, policyApi] = useCollection('insurancePolicies')
+  const ins = policies[0] ?? { provider: 'No plan on file', tier: '—', nhiaId: '—', status: 'NONE' }
+  const [claims] = useCollection('claims')
+  const [deps] = useCollection('dependants')
   return (
     <>
       <PageHeader title="Insurance" subtitle="Your NHIA / HMO coverage and claims." />
@@ -523,21 +585,26 @@ export function Insurance() {
             <Icon name="Shield" size={28} />
             <div><b>{ins.provider}</b><small>{ins.tier} plan</small></div>
           </div>
-          <KeyValue items={[['Enrollee ID', ins.nhiaId], ['Primary facility', 'LUTH, Idi-Araba'], ['Dependants', '1'], ['Renews', '31 Mar 2027']]} />
+          <KeyValue items={[['Enrollee ID', ins.nhiaId], ['Primary facility', ins.primaryFacility ?? '—'], ['Dependants', deps.length], ['Renews', ins.renews ? fmtDate(ins.renews) : '—']]} />
         </Card>
         <Card title="Recent claims">
-          <List items={[
-            { id: 1, icon: 'FileCheck', title: 'Consultation + HbA1c', subtitle: 'LUTH · ₦28,500', right: <Badge>UNDER_REVIEW</Badge> },
-            { id: 2, icon: 'FileCheck', title: 'Dental cleaning', subtitle: 'Reddington · ₦12,000', right: <Badge>APPROVED</Badge> },
-          ]} />
+          <List items={claims.slice(0, 5).map((c) => ({ id: c.id, icon: 'FileCheck', title: c.diagnosis ?? c.id, subtitle: `${c.provider} · ${naira(c.amount)}`, right: <Badge>{c.status}</Badge> }))} empty="No claims yet." />
         </Card>
       </Grid>
       <Card title="Change or add coverage">
-        <div className="form form--2">
-          <Field label="Provider" as="select" options={hmos.map((h) => h.name)} />
-          <Field label="Enrollee / policy ID" />
-          <div className="form__actions"><Button>Verify coverage</Button></div>
-        </div>
+        <form className="form form--2" onSubmit={(e) => {
+          e.preventDefault()
+          const f = Object.fromEntries(new FormData(e.currentTarget))
+          const plan = { provider: f.provider, nhiaId: f.policyId, tier: '—', status: 'PENDING_VERIFICATION', submittedAt: new Date().toISOString() }
+          if (policies[0]) policyApi.update(policies[0].id, plan)
+          else policyApi.add({ patient: user.name, patientId: user.id, ...plan })
+          e.currentTarget.reset()
+          toast('Coverage submitted — your HMO will confirm it')
+        }}>
+          <Field label="Provider" name="provider" as="select" options={hmos.map((h) => h.name)} />
+          <Field label="Enrollee / policy ID" name="policyId" required />
+          <div className="form__actions"><Button type="submit">Verify coverage</Button></div>
+        </form>
       </Card>
     </>
   )
@@ -546,6 +613,8 @@ export function Insurance() {
 /* ================= Facilities ================= */
 export function Facilities() {
   const [facilities] = useCollection('facilities')
+  const [, labs] = useCollection('labOrders')
+  const { user } = useAuth()
   const [q, setQ] = useState('')
   const toast = useToast()
   const list = filterRows(facilities.filter((f) => f.status === 'VERIFIED'), q, ['name', 'type', 'state'])
@@ -559,8 +628,8 @@ export function Facilities() {
             <p className="muted"><Icon name="MapPin" size={14} /> {f.type} · {f.state}</p>
             <small className="muted">Reg. {f.regNo}</small>
             <div className="row-actions">
-              {f.type === 'Laboratory' ? <Button size="sm" onClick={() => toast('Lab test booked — show your Health ID at the lab')}>Book a test</Button> : <Button size="sm" variant="ghost">View</Button>}
-              <Button size="sm" variant="ghost" icon="MapPin">Directions</Button>
+              {f.type === 'Laboratory' ? <Button size="sm" onClick={() => { const test = window.prompt(`Which test would you like at ${f.name}?`, 'Full Blood Count'); if (!test?.trim()) return; labs.add({ patientId: user.id, patient: user.name, test: test.trim(), lab: f.name, orderedBy: 'Self-booked', priority: 'ROUTINE', status: 'ORDERED', sample: 'PENDING', orderedAt: new Date().toISOString(), released: false }); toast('Lab test booked — show your Health ID at the lab') }}>Book a test</Button> : <Button size="sm" variant="ghost" onClick={() => window.open(`https://www.google.com/maps/search/${encodeURIComponent(f.name)}`, '_blank')}>View</Button>}
+              <Button size="sm" variant="ghost" icon="MapPin" onClick={() => window.open(`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(f.name)}`, '_blank')}>Directions</Button>
             </div>
           </Card>
         ))}
@@ -572,6 +641,8 @@ export function Facilities() {
 /* ================= AI assistant ================= */
 const EMERGENCY = /(chest pain|can.?t breathe|unconscious|bleeding heavily|seizure|suicid|stroke)/i
 export function Assistant() {
+  const { user } = useAuth()
+  const [, aiLog] = useCollection('aiFlags')
   const [msgs, setMsgs] = useState([{ from: 'ai', text: 'Hello! I’m the Healthchatter assistant. I can explain health information and help you find care. I’m not a doctor and can’t diagnose or prescribe.' }])
   const [text, setText] = useState('')
   const send = (e) => {
@@ -582,8 +653,11 @@ export function Assistant() {
       ? { from: 'ai', emergency: true, text: 'This could be a medical emergency. Please call 112 or go to the nearest emergency department now. I’ve alerted the on-call clinician.' }
       : /dose|double|stop taking|how many tablets/i.test(q)
         ? { from: 'ai', text: 'I can’t give medication dosing advice. Would you like to message your doctor about this?', action: true }
-        : { from: 'ai', text: 'Here’s some general information. Common causes include infections, stress or dehydration. If symptoms last more than 3 days or get worse, book a doctor. Would you like me to find one?' }
+        : { from: 'ai', text: 'I can’t answer health questions yet — the AI service isn’t connected. Please message a doctor or book a consultation for advice.', action: true }
     setMsgs([...msgs, { from: 'me', text: q }, reply])
+    // Logged for the safety team (Super Admin → AI Safety Review).
+    const flag = reply.emergency ? 'EMERGENCY_ESCALATION' : reply.action && /dose|double|stop taking|how many tablets/i.test(q) ? 'MEDICATION_ADVICE' : 'NONE'
+    aiLog.add({ user: user.name, patientId: user.id, prompt: q, response: reply.text, flag, model: 'rules (no AI connected)', status: flag === 'NONE' ? 'OK' : 'NEEDS_REVIEW', at: new Date().toISOString() })
     setText('')
   }
   return (
@@ -611,6 +685,7 @@ export function Assistant() {
 
 /* ================= Family / proxy access ================= */
 export function FamilyAccess() {
+  const navigate = useNavigate()
   const [rows, api] = useCollection('dependants')
   const [open, setOpen] = useState(false)
   const [form, setForm] = useState({ name: '', relation: 'Child', age: '', access: 'FULL' })
@@ -624,7 +699,7 @@ export function FamilyAccess() {
           <Card key={p.id}>
             <div className="next-appt"><Avatar name={p.name} size={48} /><div><b>{p.name}</b><small>{p.relation} · {p.age} yrs · {p.healthId}</small></div></div>
             <p>Access: <Badge>{p.access}</Badge></p>
-            <div className="row-actions"><Button size="sm" variant="ghost">Open record</Button><Button size="sm" variant="ghost" onClick={() => api.remove(p.id)}>Remove</Button></div>
+            <div className="row-actions"><Button size="sm" variant="ghost" onClick={() => navigate(`${BASE}/doctors`)}>Book for them</Button><DeleteButton label="Remove" what={`${p.name}'s access`} onConfirm={() => api.remove(p.id)} /></div>
           </Card>
         ))}
       </div>
@@ -649,7 +724,7 @@ export function Privacy() {
   const [log] = useCollection('auditLog')
   const [requests, rq] = useCollection('dataRequests')
   const consentTypes = ['Telemedicine', 'Record sharing across facilities', 'Lab result sharing', 'Insurance information sharing', 'AI interaction', 'Marketing']
-  const mine = (t) => consents.find((c) => c.patient === user.name && c.type === t)
+  const mine = (t) => consents.find((c) => c.type === t)
   const toggle = (t, on) => {
     const c = mine(t)
     const status = on ? 'GRANTED' : 'WITHDRAWN'
@@ -673,11 +748,11 @@ export function Privacy() {
             { id: 'd', icon: 'Trash2', tone: 'red', title: 'Delete my account', subtitle: 'Clinical records are kept as required by law.', onClick: () => { rq.add({ subject: user.name, type: 'DELETION', detail: 'Delete account', status: 'NEW', at: new Date().toISOString(), due: new Date(Date.now() + 30 * 864e5).toISOString() }); toast('Deletion request sent') } },
           ]} />
           <h3 className="sub">My requests</h3>
-          <Table rows={requests.filter((r) => r.subject === user.name)} empty="No requests yet." columns={[{ label: 'Type', render: (r) => <Badge>{r.type}</Badge> }, { label: 'Status', render: (r) => <Badge>{r.status}</Badge> }, { label: 'Due', render: (r) => fmtDate(r.due) }]} />
+          <Table rows={requests} empty="No requests yet." columns={[{ label: 'Type', render: (r) => <Badge>{r.type}</Badge> }, { label: 'Status', render: (r) => <Badge>{r.status}</Badge> }, { label: 'Due', render: (r) => fmtDate(r.due) }]} />
         </Card>
       </Grid>
       <Card title="Who has accessed my record" pad={false}>
-        <Table rows={log.filter((l) => l.resource.includes(user.name))} empty="No one has accessed your record yet." columns={[
+        <Table rows={log} empty="No one has accessed your record yet." columns={[
           { label: 'When', render: (r) => fmtDate(r.at, true) },
           { label: 'Who', render: (r) => <span><b>{r.actor}</b><small className="block muted">{r.facility}</small></span> },
           { label: 'Action', render: (r) => <Badge>{r.action}</Badge> },

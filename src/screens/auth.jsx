@@ -1,9 +1,23 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { useAuth } from '../auth/AuthContext.jsx'
+import { MFA_CODE, useAuth } from '../auth/AuthContext.jsx'
 import { ROLES, homeFor } from '../config/roles.js'
-import { accounts as demoAccounts, DEMO_OTP, DEMO_PASSWORD } from '../data/seed.js'
+
+/* Live test accounts (created by `npm run seed:web` in HealthChatter-Backend).
+ * Only listed when running the site locally (npm run dev). */
+const TEST_PASSWORD = 'Healthchatter@2026'
+const demoAccounts = import.meta.env.DEV
+  ? [
+      ['PATIENT', 'patient@healthchatter.test'], ['DOCTOR', 'pending.doctor@healthchatter.test', true],
+      ['NURSE', 'nurse@healthchatter.test'], ['CHW', 'chw@healthchatter.test'], ['RECEPTIONIST', 'reception@healthchatter.test'],
+      ['PHARMACIST', 'pharmacist@healthchatter.test'], ['LAB_SCIENTIST', 'lab@healthchatter.test'], ['BILLING_OFFICER', 'billing@healthchatter.test'],
+      ['FACILITY_ADMIN', 'facility@healthchatter.test'], ['CLAIMS_OFFICER', 'claims@healthchatter.test'], ['MODERATOR', 'moderator@healthchatter.test'], ['MODERATOR', 'moderator.reddington@healthchatter.test'],
+      ['COMPLIANCE_OFFICER', 'compliance@healthchatter.test'], ['SUPER_ADMIN', 'admin@healthchatter.test'],
+    ].map(([role, email, pending]) => ({ id: email, role, email, status: pending ? 'PENDING_VERIFICATION' : 'ACTIVE' }))
+  : []
 import { useCollection } from '../lib/store.js'
+import { api as request } from '../lib/api.js'
+import { uploadFile } from '../lib/files.js'
 import { Alert, Button, Field, Icon } from '../components/ui/index.jsx'
 import logoMark from '../assets/logo-mark.png'
 
@@ -44,22 +58,27 @@ export function Login() {
   const [error, setError] = useState('')
   const [show, setShow] = useState(false)
 
-  const submit = (e) => {
+  const [busy, setBusy] = useState(false)
+
+  const submit = async (e) => {
     e.preventDefault()
     setError('')
+    setBusy(true)
     try {
-      const { next, user } = signIn(email, password)
+      const { next, user } = await signIn(email, password)
       if (next === 'mfa') navigate('/verify')
       else if (next === 'pending') navigate('/pending-verification')
       else navigate(location.state?.from ?? homeFor(user.role))
     } catch (err) {
       setError(err.message)
+    } finally {
+      setBusy(false)
     }
   }
 
   const fill = (acc) => {
     setEmail(acc.email)
-    setPassword(DEMO_PASSWORD)
+    setPassword(TEST_PASSWORD)
   }
 
   return (
@@ -79,15 +98,15 @@ export function Login() {
           <span />
           <Link to="/forgot-password">Forgot password?</Link>
         </div>
-        <Button type="submit" className="b--block">Sign in</Button>
+        <Button type="submit" className="b--block" disabled={busy}>Sign in</Button>
         <p className="auth__alt">
           New to Healthchatter? <Link to="/signup">Create an account</Link>
         </p>
       </form>
 
-      <details className="demo">
+      {demoAccounts.length > 0 && <details className="demo">
         <summary>
-          <Icon name="Users" size={16} /> Demo accounts (password <code>{DEMO_PASSWORD}</code>, MFA code <code>{DEMO_OTP}</code>)
+          <Icon name="Users" size={16} /> Test accounts (password <code>{TEST_PASSWORD}</code>, MFA code <code>{MFA_CODE}</code>)
         </summary>
         <div className="demo__grid">
           {demoAccounts.map((a) => (
@@ -97,7 +116,7 @@ export function Login() {
             </button>
           ))}
         </div>
-      </details>
+      </details>}
     </AuthLayout>
   )
 }
@@ -128,13 +147,13 @@ export function VerifyMfa() {
   }
 
   return (
-    <AuthLayout title="Two-step verification" subtitle={`${ROLES[pending.role].label} accounts need a second step. Enter the 6-digit code sent to ${pending.phone.replace(/\d(?=\d{4})/g, '•')} or your authenticator app.`}>
+    <AuthLayout title="Two-step verification" subtitle={`${ROLES[pending.role].label} accounts need a second step. Enter the 6-digit code sent to ${pending.phone ? pending.phone.replace(/\d(?=\d{4})/g, '•') : 'your phone'} or your authenticator app.`}>
       <form onSubmit={submit} className="form">
         {error && <Alert tone="danger">{error}</Alert>}
         <Field label="Verification code" inputMode="numeric" maxLength={6} autoFocus value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))} className="otp" placeholder="••••••" />
         <Button type="submit" className="b--block" disabled={code.length !== 6}>Verify & continue</Button>
         <div className="form__row">
-          <button type="button" className="link" onClick={() => setError('A new code has been sent.')}>Resend code</button>
+          <button type="button" className="link" onClick={() => setError('Two-step codes are not sent by SMS yet — use the code your administrator gave you.')}>Resend code</button>
           <button type="button" className="link" onClick={() => { signOut(); navigate('/login') }}>Use a different account</button>
         </div>
       </form>
@@ -144,8 +163,20 @@ export function VerifyMfa() {
 
 /* ================= Forgot password ================= */
 export function ForgotPassword() {
+  const { sendPasswordReset } = useAuth()
   const [sent, setSent] = useState(false)
   const [email, setEmail] = useState('')
+  const [error, setError] = useState('')
+  const submit = async (e) => {
+    e.preventDefault()
+    setError('')
+    try {
+      await sendPasswordReset(email)
+      setSent(true)
+    } catch (err) {
+      setError(err.message)
+    }
+  }
   return (
     <AuthLayout title="Reset your password" subtitle="We'll send a reset link to your email, or an SMS code if you registered with a phone number.">
       {sent ? (
@@ -154,7 +185,8 @@ export function ForgotPassword() {
           <Link to="/login" className="b b--ghost b--block">Back to sign in</Link>
         </div>
       ) : (
-        <form className="form" onSubmit={(e) => { e.preventDefault(); setSent(true) }}>
+        <form className="form" onSubmit={submit}>
+          {error && <Alert tone="danger">{error}</Alert>}
           <Field label="Email or phone number" required value={email} onChange={(e) => setEmail(e.target.value)} />
           <Button type="submit" className="b--block">Send reset link</Button>
           <Link to="/login" className="auth__alt">Back to sign in</Link>
@@ -189,10 +221,19 @@ const PATIENT_CONSENTS = [
 export function Signup() {
   const { signUp } = useAuth()
   const navigate = useNavigate()
-  const [hmos] = useCollection('hmos')
+  // Real HMO list from the database (public endpoint — the visitor isn't signed in yet).
+  const [hmos, setHmos] = useState([])
+  useEffect(() => {
+    fetch(`${import.meta.env.VITE_API_URL ?? 'http://localhost:4000'}/web/public/hmos`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then(setHmos, () => setHmos([]))
+  }, [])
   const [step, setStep] = useState(0)
   const [type, setType] = useState(null)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [docs, setDocs] = useState([])
   const [form, setForm] = useState({ name: '', email: '', phone: '', password: '', dob: '', gender: 'Female', state: 'Lagos', genotype: 'AA', bloodGroup: 'O+', coverage: 'Self-pay', policyId: '', license: '', specialty: '', facility: '', facilityType: 'Private hospital', regNo: '', nin: '' })
   const [consents, setConsents] = useState({ account: false, privacy: false, telemedicine: true, sharing: true, labs: true, insurance: true, ai: false, marketing: false, provider: false, dataProtection: false })
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }))
@@ -202,28 +243,42 @@ export function Signup() {
   const steps = isPatient ? ['Account type', 'Your details', 'Consent', 'Health profile'] : ['Account type', 'Your details', 'Credentials', 'Agreements']
   const age = form.dob ? Math.floor((Date.now() - new Date(form.dob)) / 3.15576e10) : null
 
-  const next = (e) => {
+  const next = async (e) => {
     e?.preventDefault()
     setError('')
     if (step === 2 && isPatient && (!consents.account || !consents.privacy)) return setError('Please accept the required items to continue.')
     if (step === 3 && !isPatient && (!consents.provider || !consents.dataProtection)) return setError('Please accept both agreements to submit.')
     if (step < steps.length - 1) return setStep((s) => s + 1)
+    setBusy(true)
     try {
-      const account = signUp({
+      const account = await signUp({
         role: type,
-        name: isFacility ? `${form.name}` : form.name,
+        name: form.name,
         email: form.email,
         phone: form.phone,
         password: form.password,
-        status: isPatient ? 'ACTIVE' : 'PENDING_VERIFICATION',
         license: isFacility ? form.regNo : form.license,
-        specialty: form.specialty,
+        specialty: isFacility ? form.facilityType : form.specialty,
         facility: form.facility || undefined,
-        healthId: isPatient ? `HC-${Math.floor(200000 + Math.random() * 99999)}` : undefined,
+        healthProfile: isPatient
+          ? { dateOfBirth: form.dob, gender: form.gender, state: form.state, genotype: form.genotype, bloodGroup: form.bloodGroup, coverageType: form.coverage, policyId: form.policyId }
+          : undefined,
       })
+      if (account.confirmEmail) {
+        setNotice(`We've sent a confirmation link to ${form.email}. Confirm your email, then sign in${docs.length ? ' and upload your documents from the verification page' : ''}.`)
+        return
+      }
+      // Attach the uploaded licence / ID to the account's licence review.
+      if (!isPatient && docs.length) {
+        const uploaded = await Promise.all(docs.map((f) => uploadFile(f)))
+        const mine = (await request('/web/collections/verifications')).find((x) => x.userId === account.id)
+        if (mine) await request(`/web/collections/verifications/${mine.id}`, { method: 'PATCH', body: { docs: uploaded.map((u) => ({ id: u.id, name: u.name })) } })
+      }
       navigate(isPatient ? homeFor(account.role) : '/pending-verification')
     } catch (err) {
       setError(err.message)
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -238,8 +293,14 @@ export function Signup() {
         ))}
       </ol>
       {error && <Alert tone="danger">{error}</Alert>}
+      {notice && (
+        <div className="form">
+          <Alert tone="success" title="Check your inbox">{notice}</Alert>
+          <Link to="/login" className="b b--ghost b--block">Go to sign in</Link>
+        </div>
+      )}
 
-      {step === 0 && (
+      {!notice && step === 0 && (
         <div className="choice-grid">
           {ACCOUNT_TYPES.map((t) => (
             <button key={t.role} className={`choice ${type === t.role ? 'is-active' : ''}`} onClick={() => setType(t.role)}>
@@ -255,7 +316,7 @@ export function Signup() {
         </div>
       )}
 
-      {step === 1 && (
+      {!notice && step === 1 && (
         <form className="form form--2" onSubmit={next}>
           <Field label={isFacility ? 'Your full name (administrator)' : 'Full name'} required value={form.name} onChange={set('name')} />
           <Field label="Email" type="email" required value={form.email} onChange={set('email')} />
@@ -277,7 +338,7 @@ export function Signup() {
         </form>
       )}
 
-      {step === 2 && isPatient && (
+      {!notice && step === 2 && isPatient && (
         <form className="form" onSubmit={next}>
           <p className="muted">Choose what you agree to. You can change optional items any time in Privacy & Consent.</p>
           {PATIENT_CONSENTS.map((c) => (
@@ -293,22 +354,22 @@ export function Signup() {
         </form>
       )}
 
-      {step === 3 && isPatient && (
+      {!notice && step === 3 && isPatient && (
         <form className="form form--2" onSubmit={next}>
           <Field label="Gender" as="select" options={['Female', 'Male', 'Prefer not to say']} value={form.gender} onChange={set('gender')} />
           <Field label="State" as="select" options={['Lagos', 'FCT', 'Kano', 'Rivers', 'Oyo', 'Kaduna', 'Enugu', 'Anambra', 'Other']} value={form.state} onChange={set('state')} />
           <Field label="Genotype" as="select" options={['AA', 'AS', 'SS', 'AC', 'SC', "Don't know"]} value={form.genotype} onChange={set('genotype')} />
           <Field label="Blood group" as="select" options={['O+', 'O-', 'A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', "Don't know"]} value={form.bloodGroup} onChange={set('bloodGroup')} />
-          <Field label="Health coverage" as="select" options={['Self-pay', ...hmos.map((h) => h.name)]} value={form.coverage} onChange={set('coverage')} />
+          <Field label="Health coverage" as="select" options={['Self-pay', ...hmos]} value={form.coverage} onChange={set('coverage')} />
           {form.coverage !== 'Self-pay' && <Field label="Policy / enrollee ID" value={form.policyId} onChange={set('policyId')} />}
           <div className="form__actions">
             <Button type="button" variant="ghost" onClick={() => setStep(2)}>Back</Button>
-            <Button type="submit">Create account</Button>
+            <Button type="submit" disabled={busy}>Create account</Button>
           </div>
         </form>
       )}
 
-      {step === 2 && !isPatient && (
+      {!notice && step === 2 && !isPatient && (
         <form className="form form--2" onSubmit={next}>
           {isFacility ? (
             <>
@@ -327,8 +388,8 @@ export function Signup() {
           <Field label="Upload licence & government ID">
             <div className="upload">
               <Icon name="Upload" size={18} />
-              <span>Drop PDF/JPG files or <u>browse</u></span>
-              <input type="file" multiple accept=".pdf,image/*" />
+              <span>{docs.length ? docs.map((d) => d.name).join(', ') : <>Drop PDF/JPG files or <u>browse</u></>}</span>
+              <input type="file" multiple accept=".pdf,image/*" onChange={(e) => setDocs([...e.target.files])} />
             </div>
           </Field>
           <Alert tone="info">A Healthchatter moderator checks your details against the {isFacility ? 'state facility register' : `${ROLES[type].regulator} register`} — usually within 2 working days.</Alert>
@@ -339,7 +400,7 @@ export function Signup() {
         </form>
       )}
 
-      {step === 3 && !isPatient && (
+      {!notice && step === 3 && !isPatient && (
         <form className="form" onSubmit={next}>
           <label className="check">
             <input type="checkbox" checked={consents.provider} onChange={(e) => setConsents((x) => ({ ...x, provider: e.target.checked }))} />
@@ -351,7 +412,7 @@ export function Signup() {
           </label>
           <div className="form__actions">
             <Button type="button" variant="ghost" onClick={() => setStep(2)}>Back</Button>
-            <Button type="submit">Submit for verification</Button>
+            <Button type="submit" disabled={busy}>Submit for verification</Button>
           </div>
         </form>
       )}
@@ -362,24 +423,43 @@ export function Signup() {
 /* ================= Accept staff invite ================= */
 export function AcceptInvite() {
   const navigate = useNavigate()
+  const { user, pending, loading, updateUser, setPassword } = useAuth()
+  const me = user ?? pending
   const [done, setDone] = useState(false)
-  const params = new URLSearchParams(useLocation().search)
-  const role = ROLES[params.get('role')] ? params.get('role') : 'RECEPTIONIST'
+  const [error, setError] = useState('')
+  if (loading) return null
+  if (!me) {
+    return (
+      <AuthLayout title="Invite link expired" subtitle="Open the latest invite email again, or use Forgot password on the sign-in page.">
+        <Link to="/forgot-password" className="b b--primary b--block">Get a new link</Link>
+      </AuthLayout>
+    )
+  }
+  const submit = async (e) => {
+    e.preventDefault()
+    setError('')
+    const form = new FormData(e.currentTarget)
+    try {
+      await setPassword(form.get('password'))
+      if (form.get('name') && form.get('name') !== me.name) await updateUser({ name: form.get('name') })
+      setDone(true)
+    } catch (err) {
+      setError(err.message)
+    }
+  }
   return (
-    <AuthLayout title="Join your team" subtitle={`Lagos University Teaching Hospital invited you as ${ROLES[role].label}.`}>
+    <AuthLayout title="Join your team" subtitle={`${me.facility ?? me.payer ?? 'Healthchatter'} invited you as ${ROLES[me.role]?.label ?? me.role}.`}>
       {done ? (
         <div className="form">
-          <Alert tone="success" title="You're all set">Your account is active. Sign in with your email, password and authenticator code.</Alert>
+          <Alert tone="success" title="You're all set">Your account is active. Sign in with your email and new password.</Alert>
           <Button className="b--block" onClick={() => navigate('/login')}>Go to sign in</Button>
         </div>
       ) : (
-        <form className="form" onSubmit={(e) => { e.preventDefault(); setDone(true) }}>
-          <Field label="Full name" required />
-          <Field label="Create password" type="password" minLength={8} required />
-          <Field label="Set up two-step verification" hint="Scan with Google Authenticator or Microsoft Authenticator, then enter the code.">
-            <div className="qr" aria-label="QR code placeholder"><Icon name="ScanLine" size={40} /></div>
-          </Field>
-          <Field label="Authenticator code" inputMode="numeric" maxLength={6} required />
+        <form className="form" onSubmit={submit}>
+          {error && <Alert tone="danger">{error}</Alert>}
+          <Field label="Full name" name="name" defaultValue={me.name} required />
+          <Field label="Email" value={me.email} readOnly />
+          <Field label="Create password" name="password" type="password" minLength={8} required />
           <Button type="submit" className="b--block">Activate account</Button>
         </form>
       )}
@@ -391,9 +471,21 @@ export function AcceptInvite() {
 export function PendingVerification() {
   const { user, signOut } = useAuth()
   const navigate = useNavigate()
-  const [verifications] = useCollection('verifications')
-  const v = verifications.find((x) => x.name === user?.name)
+  const [verifications, vApi] = useCollection('verifications')
+  const v = verifications.find((x) => x.userId === user?.id)
   const status = v?.status ?? 'PENDING'
+  const [uploading, setUploading] = useState('')
+  const addDocs = async (files) => {
+    if (!v || !files.length) return
+    setUploading('Uploading…')
+    try {
+      const uploaded = await Promise.all([...files].map((f) => uploadFile(f)))
+      vApi.update(v.id, { docs: [...(v.docs ?? []), ...uploaded.map((u) => ({ id: u.id, name: u.name }))] })
+      setUploading(`Uploaded ${uploaded.length} file(s) — your moderator will review them.`)
+    } catch (err) {
+      setUploading(err.message)
+    }
+  }
   return (
     <AuthLayout title={status === 'REJECTED' ? 'Verification unsuccessful' : status === 'APPROVED' ? 'You are verified' : 'Verification in progress'}>
       <div className="form">
@@ -401,15 +493,26 @@ export function PendingVerification() {
           <Alert tone="danger" title="We couldn't verify your licence">{v?.note ?? 'Please upload a current practising licence and resubmit.'}</Alert>
         ) : status === 'APPROVED' ? (
           <Alert tone="success" title="Approved">Sign in again to open your workspace.</Alert>
+        ) : status === 'INFO_REQUESTED' ? (
+          <Alert tone="warning" title="More information needed">{v?.note ?? 'Please upload the requested documents.'}</Alert>
         ) : (
           <Alert tone="info" title={`Thanks, ${user?.name ?? 'there'}`}>Our moderators are checking your {ROLES[user?.role]?.regulator ?? 'registration'} details. You'll get an email and SMS once approved.</Alert>
         )}
         <ol className="timeline">
           <li className="is-done"><b>Account created</b><small>Email confirmed</small></li>
-          <li className="is-done"><b>Documents submitted</b><small>Licence & ID uploaded</small></li>
-          <li className={status !== 'PENDING' ? 'is-done' : ''}><b>Registry check</b><small>Moderator review</small></li>
+          <li className={v?.docs?.length ? 'is-done' : ''}><b>Documents submitted</b><small>{v?.docs?.length ? `${v.docs.length} file(s) uploaded` : 'Nothing uploaded yet'}</small></li>
+          <li className={['APPROVED', 'REJECTED'].includes(status) ? 'is-done' : ''}><b>Registry check</b><small>Moderator review</small></li>
           <li className={status === 'APPROVED' ? 'is-done' : ''}><b>Workspace unlocked</b></li>
         </ol>
+        {v && status !== 'APPROVED' && (
+          <Field label="Upload licence or ID documents">
+            <div className="upload">
+              <Icon name="Upload" size={18} />
+              <span>{uploading || <>Drop PDF/JPG files or <u>browse</u></>}</span>
+              <input type="file" multiple accept=".pdf,image/*" onChange={(e) => addDocs(e.target.files)} />
+            </div>
+          </Field>
+        )}
         <Button variant="ghost" className="b--block" onClick={() => { signOut(); navigate('/login') }}>Sign out</Button>
       </div>
     </AuthLayout>
